@@ -1,0 +1,3 @@
+library_dir = "./library-smoke"
+feed_check_days = 0
+backfill_on_start = false

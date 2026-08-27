@@ -1,0 +1,3 @@
+# Container-side librarian config. Everything except library_dir stays at
+# code defaults; BOOKSHELF_DATABASE_URL (env) always wins over any file key.
+library_dir = "/data"

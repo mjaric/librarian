@@ -1,0 +1,37 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: bookshelf
+      POSTGRES_PASSWORD: bookshelf
+      POSTGRES_DB: bookshelf
+    volumes:
+      - bookshelf-pgdata:/var/lib/postgresql/data
+    # Published so the host-side `librarian` CLI (sync/repair/status ...)
+    # talks to the same queue the containerized daemon LISTENs on.
+    ports:
+      - "127.0.0.1:5432:5432"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bookshelf -d bookshelf"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  librarian:
+    build: .
+    # Matches the host user (uid/gid 1000) so mirror files on the bind mount
+    # are directly usable without docker later.
+    user: "1000:1000"
+    init: true
+    environment:
+      BOOKSHELF_DATABASE_URL: postgres://bookshelf:bookshelf@postgres:5432/bookshelf
+      RUST_LOG: info
+    volumes:
+      - ${HOME}/.bookshelf:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  bookshelf-pgdata:

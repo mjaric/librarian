@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<rss version="0.91">
+  <channel>
+    <title>Project Gutenberg Recently Posted or Updated EBooks</title>
+    <link>https://www.gutenberg.org</link>
+    <description>
+       EBooks posted or updated today on Project Gutenberg.
+       This feed is regenerated every night.
+    </description>
+    <language>en-us</language>
+    <webMaster>webmaster@gutenberg.org</webMaster>
+    <pubDate>Thu, 27 Aug 2026 17:51:19 -0400</pubDate>
+    <lastBuildDate>Thu, 27 Aug 2026 17:51:19 -0400</lastBuildDate>
+    <item>
+      <title>The philosophical and mathematical commentaries of Proclus on the first book of Euclid&#039;s elements (V</title>
+      <link>https://www.gutenberg.org/ebooks/79455</link>
+      <description>Language: English</description>
+    </item>
+
+    <item>
+      <title>Plays and controversies by W. B.  Yeats</title>
+      <link>https://www.gutenberg.org/ebooks/79460</link>
+      <description>Language: English</description>
+    </item>
+
+    <item>
+      <title>La messe là-bas by Paul Claudel</title>
+      <link>https://www.gutenberg.org/ebooks/79457</link>
+      <description>Language: French</description>
+    </item>
+
+    <item>
+      <title>The Everlasting Man by G. K.  Chesterton</title>
+      <link>https://www.gutenberg.org/ebooks/65688</link>
+      <description>Language: English</description>
+    </item>
+
+    <item>
+      <title>The 1990 United States Census by United States. Bureau of the Census</title>
+      <link>https://www.gutenberg.org/ebooks/37</link>
+      <description>Language: English</description>
+    </item>
+
+  </channel>
+</rss>

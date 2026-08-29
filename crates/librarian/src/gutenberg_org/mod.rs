@@ -11,17 +11,25 @@ pub mod taxonomy;
 use async_trait::async_trait;
 use bookshelf_core::domain::{EventKind, EventSink, Json, Triage};
 use bookshelf_core::triage_rules;
-use bookshelf_core::{FetchError, InterruptFlag, PoliteClient, RsyncRunner, StorePostgres};
+use bookshelf_core::{
+    ActiveRun, FetchError, InterruptFlag, PoliteClient, RsyncRunner, StorePostgres,
+};
+use opentelemetry::Context;
+use opentelemetry::KeyValue;
+use opentelemetry::global::BoxedSpan;
+use opentelemetry::trace::{Span as _, SpanContext, TraceContextExt, Tracer as _};
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 use time::OffsetDateTime;
 
 use crate::config::{Config, TriageMode};
+use crate::observability::{Observability, phase_span_name};
 use crate::provider::{
     CycleOpts, CycleReport, ProgressReport, Provider, RepairReport, StatusReport,
 };
-use mirror::{Mirror, PullResult};
+use mirror::{Mirror, MirrorLive, PullResult};
 use rdf::MirrorEntry;
 
 pub const SOURCE_KEY: &str = "project-gutenberg";
@@ -34,6 +42,9 @@ pub struct GutenbergOrg {
     mirror: Mirror,
     interrupt: InterruptFlag,
     triage: Option<Arc<dyn Triage>>,
+    /// Attached once by the daemon (`Provider::set_observability`); None on
+    /// CLI-only paths.
+    obs: OnceLock<Observability>,
 }
 impl GutenbergOrg {
     pub fn new(
@@ -96,6 +107,7 @@ impl GutenbergOrg {
             mirror,
             interrupt,
             triage,
+            obs: OnceLock::new(),
         })
     }
 
@@ -479,12 +491,14 @@ impl GutenbergOrg {
         report: &mut CycleReport,
         ingest: bool,
         requested: &[i64],
+        guard: &ActiveRunGuard,
     ) -> anyhow::Result<()> {
         self.record_pull(pull).await;
         if self.interrupt.is_set() {
             return Ok(());
         }
         if ingest {
+            guard.set_phase("ingesting");
             let mut ids: Vec<i64> = requested.to_vec();
             ids.extend(pull.ingest_ids());
             ids.sort_unstable();
@@ -495,6 +509,7 @@ impl GutenbergOrg {
             } else {
                 ids
             };
+            guard.phase_attr("ids", ids.len() as i64);
             if !ids.is_empty() {
                 self.ingest(ids, report).await?;
             }
@@ -502,6 +517,7 @@ impl GutenbergOrg {
         if self.interrupt.is_set() {
             return Ok(());
         }
+        guard.set_phase("repairing");
         let only_slice = if requested.is_empty() {
             None
         } else {
@@ -553,10 +569,225 @@ async fn async_move_write(path: &std::path::Path, value: &Json) -> anyhow::Resul
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// active_run lifecycle (live cycle progress in `meta`)
+// ---------------------------------------------------------------------------
+
+/// Publishes the current cycle as an `active_run` JSON row in `meta` (5 s
+/// cadence) and mirrors live rsync counters into the observability
+/// snapshot. The guard lives on the stack of `full_cycle`/`feed_cycle`, so
+/// EVERY exit path — normal completion, `?` error propagation, the
+/// interrupted / rsync_failed early returns, even a panic unwind — runs
+/// [`Drop::drop`], which aborts the updater task and clears the meta key.
+/// It also carries the job's trace: one open phase span at a time, each
+/// parented on the job root span context parked by the worker loop.
+struct ActiveRunGuard {
+    store: Arc<StorePostgres>,
+    obs: Option<Observability>,
+    run: Arc<parking_lot::Mutex<ActiveRun>>,
+    updater: Option<tokio::task::JoinHandle<()>>,
+    /// Clone of the guard's mirror state — the rsync `host` attribute is
+    /// read from it when the pull span ends.
+    live: MirrorLive,
+    /// Root `SpanContext` of the job's trace; phase spans parent on it.
+    /// None when tracing is off.
+    job_sc: Option<SpanContext>,
+    /// Open phase span: (span name, span). Ended on phase switch / Drop.
+    phase_span: parking_lot::Mutex<Option<(&'static str, BoxedSpan)>>,
+}
+
+impl ActiveRunGuard {
+    async fn start(
+        store: Arc<StorePostgres>,
+        live: MirrorLive,
+        obs: Option<Observability>,
+        run: ActiveRun,
+    ) -> Self {
+        let run = Arc::new(parking_lot::Mutex::new(run));
+        let job_sc = obs.as_ref().and_then(Observability::take_job_span_context);
+        publish_active_run(&store, &live, obs.as_ref(), &run).await;
+        let updater = {
+            let store = store.clone();
+            let live = live.clone();
+            let obs = obs.clone();
+            let run = run.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(5));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    publish_active_run(&store, &live, obs.as_ref(), &run).await;
+                }
+            })
+        };
+        Self {
+            store,
+            obs,
+            run,
+            updater: Some(updater),
+            live,
+            job_sc,
+            phase_span: parking_lot::Mutex::new(None),
+        }
+    }
+
+    fn set_phase(&self, phase: &str) {
+        self.run.lock().phase = phase.to_string();
+        self.trace_phase(phase);
+    }
+
+    /// Attach an attribute to the open phase span (e.g. the ingest id
+    /// count). No-op when tracing is off or no span is open.
+    fn phase_attr(&self, key: &'static str, value: i64) {
+        if let Some((_, span)) = self.phase_span.lock().as_mut() {
+            span.set_attribute(KeyValue::new(key, value));
+        }
+    }
+
+    /// End the open phase span, recording end-of-phase attributes (the
+    /// rsync host is only known once the transfer has run).
+    fn end_phase_span(&self) {
+        let Some((name, mut span)) = self.phase_span.lock().take() else {
+            return;
+        };
+        if name == "rsync.pull" {
+            if let Some(host) = self.live.host() {
+                span.set_attribute(KeyValue::new("host", host));
+            }
+        }
+        span.end();
+    }
+
+    /// Swap the phase span: end the previous one, open the span for
+    /// `phase` as a child of the job root. No-op when tracing is off.
+    fn trace_phase(&self, phase: &str) {
+        let Some(sc) = self.job_sc.clone() else {
+            return;
+        };
+        self.end_phase_span();
+        let Some(name) = phase_span_name(phase) else {
+            return;
+        };
+        let Some(obs) = &self.obs else {
+            return;
+        };
+        let tracer = obs.tracer();
+        let parent = Context::new().with_remote_span_context(sc);
+        let span = tracer.build_with_context(tracer.span_builder(name), &parent);
+        *self.phase_span.lock() = Some((name, span));
+    }
+}
+
+impl Drop for ActiveRunGuard {
+    fn drop(&mut self) {
+        // The trailing phase span (repair.pass) ends at cycle exit.
+        self.end_phase_span();
+        // THE invariant: every cycle exit aborts the updater and clears
+        // `active_run` — nothing stale survives completion, interrupt,
+        // error or panic.
+        if let Some(handle) = self.updater.take() {
+            handle.abort();
+        }
+        if let Some(obs) = &self.obs {
+            let snap = obs.snapshot();
+            let mut s = snap.lock();
+            s.rsync_files = 0;
+            s.rsync_bytes = 0;
+            s.rsync_last_item_unix_ms = 0;
+        }
+        let store = self.store.clone();
+        tokio::spawn(async move {
+            if let Err(e) = store.clear_meta(SOURCE_KEY, "active_run").await {
+                tracing::warn!(error = %e, "failed to clear active_run");
+            }
+        });
+    }
+}
+
+/// Fold live mirror state into the run descriptor and write it to `meta`.
+/// Failures are logged, never propagated — observability must not break
+/// the cycle it observes.
+async fn publish_active_run(
+    store: &Arc<StorePostgres>,
+    live: &MirrorLive,
+    obs: Option<&Observability>,
+    run: &Arc<parking_lot::Mutex<ActiveRun>>,
+) {
+    let (files, bytes, last_ms) = live.snapshot();
+    let (cum_files, cum_bytes) = live.cumulative_snapshot();
+    let json = {
+        let mut r = run.lock();
+        r.files = files;
+        r.bytes = bytes;
+        r.last_item_at = rfc3339_from_unix_ms(last_ms);
+        r.host = live.host();
+        serde_json::to_string(&*r)
+    };
+    if let Some(obs) = obs {
+        {
+            let snap = obs.snapshot();
+            let mut s = snap.lock();
+            s.rsync_files = files;
+            s.rsync_bytes = bytes;
+            s.rsync_last_item_unix_ms = last_ms;
+        }
+        // Monotonic counters: add() the delta since the previous tick
+        // (first tick adds from zero = "since process start"). The
+        // per-attempt lock above must be released first — same mutex.
+        obs.observe_rsync_totals(cum_files, cum_bytes);
+    }
+    match json {
+        Ok(body) => {
+            if let Err(e) = store.set_meta(SOURCE_KEY, "active_run", &body).await {
+                tracing::warn!(error = %e, "failed to publish active_run");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "failed to serialize active_run"),
+    }
+}
+
+/// The running job row for this source (single worker ⇒ at most one).
+/// 0 when unresolvable — observability must never fail a cycle.
+async fn running_job_id(store: &Arc<StorePostgres>) -> i64 {
+    let id: Option<i64> = bookshelf_core::sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM jobs WHERE source = $1 AND status = 'running' \
+         ORDER BY started_at DESC, id DESC LIMIT 1",
+    )
+    .bind(SOURCE_KEY)
+    .fetch_optional(store.pool())
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "running job lookup failed");
+        None
+    });
+    id.unwrap_or(0)
+}
+
+fn rfc3339_now() -> String {
+    OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
+}
+
+/// Unix ms → RFC3339; None for the 0 = no-item sentinel.
+fn rfc3339_from_unix_ms(ms: u64) -> Option<String> {
+    if ms == 0 {
+        return None;
+    }
+    OffsetDateTime::from_unix_timestamp((ms / 1000) as i64)
+        .ok()?
+        .format(&time::format_description::well_known::Rfc3339)
+        .ok()
+}
+
 #[async_trait]
 impl Provider for GutenbergOrg {
     fn key(&self) -> &'static str {
         SOURCE_KEY
+    }
+
+    fn set_observability(&self, obs: Observability) {
+        let _ = self.obs.set(obs);
     }
 
     async fn full_cycle(&self, opts: CycleOpts) -> anyhow::Result<CycleReport> {
@@ -565,6 +796,25 @@ impl Provider for GutenbergOrg {
             run_id,
             ..Default::default()
         };
+        // Live progress published to `meta` from here until every exit
+        // path; the guard's Drop guarantees the teardown.
+        let guard = ActiveRunGuard::start(
+            self.store.clone(),
+            self.mirror.live(),
+            self.obs.get().cloned(),
+            ActiveRun {
+                job_id: running_job_id(&self.store).await,
+                run_id: Some(run_id),
+                kind: "full_cycle".into(),
+                phase: "listing".into(),
+                started_at: rfc3339_now(),
+                files: 0,
+                bytes: 0,
+                last_item_at: None,
+                host: None,
+            },
+        )
+        .await;
         self.store
             .apply_category_seed(SOURCE_KEY, taxonomy::SEED)
             .await?;
@@ -577,6 +827,7 @@ impl Provider for GutenbergOrg {
             return Ok(report);
         }
 
+        guard.set_phase("transferring");
         let pull = if !opts.only.is_empty() {
             self.mirror.targeted_pull(&opts.only).await
         } else if let Some(n) = opts.limit {
@@ -631,7 +882,7 @@ impl Provider for GutenbergOrg {
             return Ok(report);
         }
 
-        self.cycle_tail(&pull, &mut report, !opts.no_ingest, &opts.only)
+        self.cycle_tail(&pull, &mut report, !opts.no_ingest, &opts.only, &guard)
             .await?;
 
         let files_failed = 0;
@@ -658,6 +909,25 @@ impl Provider for GutenbergOrg {
             run_id,
             ..Default::default()
         };
+        // Live progress published to `meta` from here until every exit
+        // path; the guard's Drop guarantees the teardown.
+        let guard = ActiveRunGuard::start(
+            self.store.clone(),
+            self.mirror.live(),
+            self.obs.get().cloned(),
+            ActiveRun {
+                job_id: running_job_id(&self.store).await,
+                run_id: Some(run_id),
+                kind: "feed_cycle".into(),
+                phase: "listing".into(),
+                started_at: rfc3339_now(),
+                files: 0,
+                bytes: 0,
+                last_item_at: None,
+                host: None,
+            },
+        )
+        .await;
         self.store
             .apply_category_seed(SOURCE_KEY, taxonomy::SEED)
             .await?;
@@ -675,6 +945,7 @@ impl Provider for GutenbergOrg {
             }
         };
 
+        guard.set_phase("transferring");
         let pulled = head.ids.clone();
         let pull = if pulled.is_empty() {
             mirror::PullResult::default()
@@ -707,7 +978,8 @@ impl Provider for GutenbergOrg {
             return Ok(report);
         }
 
-        self.cycle_tail(&pull, &mut report, true, &[]).await?;
+        self.cycle_tail(&pull, &mut report, true, &[], &guard)
+            .await?;
 
         self.ev_now(
             EventKind::FeedChecked,

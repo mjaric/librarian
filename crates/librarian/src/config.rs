@@ -37,6 +37,12 @@ pub struct Config {
     pub triage: TriageMode,
     pub agent_provider: String,
     pub agent_model: String,
+    /// `[observability] otlp_endpoint` — OTLP/HTTP endpoint for metrics AND
+    /// "http://127.0.0.1:4318/" from the host or
+    /// "http://host.docker.internal:4318/" from a container (collector on
+    /// the host network). Absent → OpenTelemetry is fully disabled: no SDK,
+    /// no exporter, no network traffic. Opt-in by design.
+    pub otlp_endpoint: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -59,6 +65,13 @@ struct ConfigFile {
     contact_email: Option<String>,
     triage: Option<String>,
     agent: Option<AgentFile>,
+    observability: Option<ObservabilityFile>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ObservabilityFile {
+    otlp_endpoint: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -159,6 +172,7 @@ impl Config {
             },
             agent_provider: agent.provider.unwrap_or_else(|| "zai".into()),
             agent_model: agent.model.unwrap_or_else(|| "glm-5.3".into()),
+            otlp_endpoint: file.observability.and_then(|o| o.otlp_endpoint),
         })
     }
 

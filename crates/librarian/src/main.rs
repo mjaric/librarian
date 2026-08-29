@@ -354,6 +354,10 @@ async fn run_daemon(cfg: Arc<Config>, provider_key: &str) -> anyhow::Result<()> 
     let source = provider.key();
     let queue = JobQueue::new(store.pool().clone());
 
+    // -- observability: in-memory snapshot always on, OTLP export opt-in
+    let obs = librarian::observability::Observability::new(source, cfg.otlp_endpoint.as_deref());
+    provider.set_observability(obs.clone());
+
     // -- startup reclaim + meta anchors
     let reclaimed = store.reclaim_running_jobs().await?;
     if reclaimed > 0 {
@@ -367,6 +371,9 @@ async fn run_daemon(cfg: Arc<Config>, provider_key: &str) -> anyhow::Result<()> 
     store
         .set_meta(source, "daemon_anchor", &rfc3339(now))
         .await?;
+    // A hard kill (SIGKILL/crash) bypasses the cycle guard's Drop — clear
+    // any stale active_run so the CLI never sees a ghost run.
+    store.clear_meta(source, "active_run").await?;
     if store.get_meta(source, "next_full_sync").await?.is_none() {
         let first = if cfg.backfill_on_start {
             now
@@ -399,13 +406,63 @@ async fn run_daemon(cfg: Arc<Config>, provider_key: &str) -> anyhow::Result<()> 
         let cfg = cfg.clone();
         let source = source.to_string();
         let flag = interrupt.clone();
+        let obs = obs.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut obs_ticks: u64 = 0;
+            let mut no_mirror_logged = false;
             loop {
                 tick.tick().await;
                 if flag.is_set() {
                     break;
+                }
+                // Heartbeat from the scheduler half: the worker loop blocks
+                // inside execute_job during long cycles, so this 30 s write
+                // keeps the heartbeat a "process alive" signal. Written
+                // before the snapshot refresh so heartbeat_age reflects it.
+                let now = time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default();
+                if let Err(e) = store.set_meta(&source, "daemon_heartbeat", &now).await {
+                    tracing::warn!(error = %e, "heartbeat write failed");
+                }
+                // Snapshot refresh is observability, not scheduling: never
+                // fail the tick because of it. The mirror book count is a
+                // blocking filesystem walk (thousands of stat calls on a
+                // full mirror): refresh it every 10th tick (30 s cadence →
+                // every 5 min), including the immediate first tick so a
+                // fresh daemon publishes a real number; ingest_gap follows
+                // every tick from the fresh DB counts. No mirror dir
+                // (non-mirror host) → zero, logged once at debug.
+                obs_ticks += 1;
+                let mirror_books = if obs_ticks % 10 == 1 {
+                    let mirror_dir = cfg.mirror_dir();
+                    match tokio::task::spawn_blocking(move || {
+                        librarian::observability::count_mirror_rdfs(&mirror_dir)
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "mirror walk join failed");
+                        Some(0) // count as zero, never "no mirror dir"
+                    }) {
+                        Some(count) => Some(count),
+                        None => {
+                            if !no_mirror_logged {
+                                no_mirror_logged = true;
+                                tracing::debug!(
+                                    dir = %cfg.mirror_dir().display(),
+                                    "no mirror dir on this host; mirror books/ingest gap stay zero"
+                                );
+                            }
+                            Some(0)
+                        }
+                    }
+                } else {
+                    None // off-walk tick: keep the last count
+                };
+                if let Err(e) = refresh_observability(&store, &source, &obs, mirror_books).await {
+                    tracing::warn!(error = %e, "observability snapshot refresh failed");
                 }
                 if let Err(e) = scheduler_tick(&store, &queue, &cfg, &source).await {
                     tracing::warn!(error = %e, "scheduler tick failed");
@@ -442,7 +499,34 @@ async fn run_daemon(cfg: Arc<Config>, provider_key: &str) -> anyhow::Result<()> 
             }
             Some(job) => {
                 tracing::info!(job = job.id, kind = %job.kind, "executing job");
+                let started = std::time::Instant::now();
+                // Trace root for this job: fresh trace id, detached from
+                // any ambient context; phase spans in the provider parent
+                // onto it. Ended below on every path.
+                let root = obs.start_job_root(source, &job.kind, job.id);
                 let outcome = execute_job(provider.as_ref(), &job).await;
+                // Cycle accounting: ok | failed | interrupted, feeding the
+                // in-memory totals and the otel counter/histogram.
+                let cycle_outcome = match &outcome {
+                    Ok(r) => {
+                        if interrupt.is_set() || r.aborted_reason.as_deref() == Some("interrupted")
+                        {
+                            "interrupted"
+                        } else {
+                            "ok"
+                        }
+                    }
+                    Err(_) if interrupt.is_set() => "interrupted",
+                    Err(_) => "failed",
+                };
+                obs.record_cycle(&job.kind, cycle_outcome, started.elapsed().as_secs_f64());
+                // Close the job's trace root on every path: ok, failed,
+                // interrupted (the run_id is only known on success).
+                root.finish(
+                    outcome.as_ref().ok().map(|r| r.run_id),
+                    cycle_outcome,
+                    started.elapsed().as_secs_f64(),
+                );
                 match outcome {
                     Ok(report) => {
                         if interrupt.is_set()
@@ -475,6 +559,7 @@ async fn run_daemon(cfg: Arc<Config>, provider_key: &str) -> anyhow::Result<()> 
 
     // graceful exit: sync_runs rows for this daemon's jobs were already
     // finalized by the providers themselves ('interrupted')
+    obs.shutdown().await;
     println!("daemon stopped cleanly");
     Ok(())
 }
@@ -580,5 +665,59 @@ async fn scheduler_tick(
             }
         }
     }
+    Ok(())
+}
+
+async fn refresh_observability(
+    store: &Arc<StorePostgres>,
+    source: &str,
+    obs: &librarian::observability::Observability,
+    mirror_books: Option<u64>,
+) -> anyhow::Result<()> {
+    let books = store.book_status_counts(source).await?;
+    let files = store.file_status_counts(source).await?;
+    let depths: Vec<(String, i64)> = bookshelf_core::sqlx::query_as(
+        "SELECT status, count(*) FROM jobs \
+         WHERE status IN ('queued', 'running') AND source = $1 GROUP BY status",
+    )
+    .bind(source)
+    .fetch_all(store.pool())
+    .await?;
+    let heartbeat_age_s = store
+        .get_meta(source, "daemon_heartbeat")
+        .await?
+        .and_then(|t| {
+            time::OffsetDateTime::parse(&t, &time::format_description::well_known::Rfc3339)
+                .ok()
+                .map(|t| (time::OffsetDateTime::now_utc() - t).whole_seconds())
+        });
+    // One get_meta: the live cycle's phase string → gauge code. No row
+    // (between cycles) or unparsable row = idle.
+    let phase = store.get_meta(source, "active_run").await?.and_then(|raw| {
+        serde_json::from_str::<bookshelf_core::observability::ActiveRun>(&raw)
+            .ok()
+            .map(|run| run.phase)
+    });
+    let snap = obs.snapshot();
+    let mut s = snap.lock();
+    if let Some(mirror) = mirror_books {
+        s.mirror_books = mirror; // off-walk ticks keep the last count
+    }
+    let db_books: i64 = books.iter().map(|(_, c)| *c).sum();
+    s.ingest_gap = librarian::observability::ingest_gap(s.mirror_books, db_books);
+    s.active_phase = librarian::observability::phase_code(phase.as_deref());
+    s.book_status_counts = books;
+    s.file_status_counts = files;
+    s.queue_queued = depths
+        .iter()
+        .find(|(status, _)| status == "queued")
+        .map(|(_, c)| *c)
+        .unwrap_or(0);
+    s.queue_running = depths
+        .iter()
+        .find(|(status, _)| status == "running")
+        .map(|(_, c)| *c)
+        .unwrap_or(0);
+    s.heartbeat_age_s = heartbeat_age_s;
     Ok(())
 }

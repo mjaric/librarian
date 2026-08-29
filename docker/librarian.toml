@@ -1,3 +1,10 @@
-# Container-side librarian config. Everything except library_dir stays at
-# code defaults; BOOKSHELF_DATABASE_URL (env) always wins over any file key.
+# Container-side librarian config. BOOKSHELF_DATABASE_URL (env) always wins
+# over any file key. library_dir stays at the container layout; observability
+# points at the OTLP/HTTP collector on the host network (telemetry compose
+# project — see the README "Monitoring" section). Bare base URL: the daemon
+# appends the /v1/metrics signal path itself.
+
 library_dir = "/data"
+
+[observability]
+otlp_endpoint = "http://host.docker.internal:4318/"

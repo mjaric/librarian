@@ -5,6 +5,7 @@
 
 pub mod config;
 pub mod gutenberg_org;
+pub mod observability;
 pub mod provider;
 pub mod queue;
 pub mod trigger;

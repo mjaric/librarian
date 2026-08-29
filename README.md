@@ -125,7 +125,40 @@ triage                = "rules"               # "rules" | "agent"
 [agent]
 provider = "zai"        # "zai" | "openai" | "ollama"
 model    = "glm-5.3"
+
+[observability]
+otlp_endpoint = "http://host.docker.internal:4318/"  # opt-in; absent = fully off
 ```
+
+Metrics are **off by default**: without `otlp_endpoint` there is no SDK, no
+exporter, no network traffic. Set it to an OTLP/HTTP collector (**:4318**,
+protobuf) and the daemon pushes every 30 s — `http://127.0.0.1:4318/` for a
+host-run daemon, `http://host.docker.internal:4318/` for the containerized
+one (compose already maps that name to the host via
+`extra_hosts: ["host.docker.internal:host-gateway"]`). Exported metrics:
+
+```text
+librarian.books{status}                   books by status
+librarian.files{status}                   book files by status
+librarian.queue{status}                   queue depth (queued, running)
+librarian.rsync_files                     files moved by the current rsync attempt
+librarian.rsync_bytes                     bytes moved by the current rsync attempt
+librarian.rsync_files_total               counter — files moved by rsync, monotonic since process start; use increase() for per-interval counts
+librarian.rsync_bytes_total               counter — bytes moved by rsync, monotonic since process start; use increase() for per-interval bytes
+librarian.rsync_last_item_age_seconds     silence since the last itemize line
+librarian.heartbeat_age_seconds           daemon process liveness
+librarian.mirror_books                    books with an RDF on the local mirror (recounted every 5 min)
+librarian.ingest_gap                      mirror books not yet in the DB; heals to ~0 at each cycle end via reconcile
+librarian.active_phase                    live cycle phase code — 0 idle, 1 listing, 2 transferring, 3 ingesting, 4 repairing
+librarian.cycles{kind,outcome}            counter — completed cycles
+librarian.cycle_duration_seconds{kind}    histogram — cycle wall-clock
+```
+
+Any OTLP/HTTP receiver works; the bundled stack lives in the separate
+`~/prj/telemetry` compose project (collector scrape — not remote-write —
+of the collector's `:8889` exporter → Prometheus `:9090` → Grafana `:3001`)
+and receives all of the above, provisioned with a ready-made Librarian
+dashboard. See the Monitoring section below.
 
 Point `library_dir` at the big volume — a full mirror is ~230 GB (txt 15 GB +
 epub.images 120–150 GB + html.zip 80–100 GB + rdf 1.5 GB + covers 3 GB).

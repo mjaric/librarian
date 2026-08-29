@@ -23,6 +23,10 @@ services:
     # are directly usable without docker later.
     user: "1000:1000"
     init: true
+    # OTLP/HTTP collector runs on the host network; from this container the
+    # endpoint is http://host.docker.internal:4318/.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       BOOKSHELF_DATABASE_URL: postgres://bookshelf:bookshelf@postgres:5432/bookshelf
       RUST_LOG: info

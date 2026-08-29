@@ -101,6 +101,10 @@ pub trait Provider: Send + Sync {
 
     /// Downloaded vs total per source (live remote catalog + local DB).
     async fn progress(&self) -> anyhow::Result<ProgressReport>;
+
+    /// Attach the daemon's live-observability handle (no-op for providers
+    /// that ignore it). Called once by the daemon before any cycle runs.
+    fn set_observability(&self, _obs: crate::observability::Observability) {}
 }
 
 /// Provider keys compiled into this binary — client-side validation so

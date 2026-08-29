@@ -8,6 +8,7 @@
 
 pub mod adapters;
 pub mod domain;
+pub mod observability;
 
 /// Re-export so downstream crates share this crate's exact sqlx version
 /// (queue code in `librarian` runs raw queries against the same pool type).
@@ -21,3 +22,4 @@ pub use adapters::rsync::{
 };
 pub use adapters::store_postgres::StorePostgres;
 pub use adapters::triage_rules;
+pub use observability::ActiveRun;

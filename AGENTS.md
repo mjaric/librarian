@@ -8,14 +8,18 @@ Binding rules (restated from README *Contributing*; details in sections below):
 
 ## Project Overview
 
-`librarian` (Rust workspace, 2 crates) mirrors the Project Gutenberg archive — politely, via their sanctioned rsync service — into PostgreSQL plus an append-only JSONL event log. Provider-based: everything Gutenberg-specific lives behind the `gutenberg_org` provider module; a second source = new module + one registry entry. Backend only; no HTTP server, no frontend.
+`librarian` (Rust workspace) mirrors the Project Gutenberg archive — politely, via their sanctioned rsync service — into PostgreSQL plus an append-only JSONL event log. Provider-based: everything Gutenberg-specific lives behind the `gutenberg_org` provider module; a second source = new module + one registry entry. On top of the store, `librarian-web` serves `bookshelf-ui` (Leptos, CSR wasm): a catalogue with search, category shelves and book pages; the UI crate is shell-agnostic so a desktop shell can embed it later against the same JSON API (`bookshelf-api` DTOs).
 
 ## Architecture & Data Flow
 
-Hexagonal-lite, two crates:
+Hexagonal-lite:
 
-- **`crates/bookshelf-core`** — source-agnostic side. Domain model + ports (`EventSink`, `Triage`) in `src/domain.rs`; adapters in `src/adapters/`: `store_postgres.rs` (sqlx pool + embedded migrations + all queries), `event_log.rs` (append-only JSONL), `http.rs` (`PoliteClient`), `rsync.rs` (`RsyncRunner`), `triage_rules.rs` (deterministic), `triage_agent.rs` (optional LLM, feature `agent`).
-- **`crates/librarian`** — the binary. `src/main.rs` (clap CLI + daemon), `config.rs`, `provider.rs` (Provider trait + registry), `queue.rs` (Postgres job queue), `gutenberg_org/` (mirror / rdf / feed / taxonomy).
+- **`crates/bookshelf-core`** — source-agnostic side. Domain model + ports (`EventSink`, `Triage`) in `src/domain.rs`; adapters in `src/adapters/`: `store_postgres.rs` (sqlx pool + embedded migrations + all queries, including the catalog reads the web UI uses), `event_log.rs` (append-only JSONL), `http.rs` (`PoliteClient`), `rsync.rs` (`RsyncRunner`), `triage_rules.rs` (deterministic), `triage_agent.rs` (optional LLM, feature `agent`).
+- **`crates/librarian`** — the daemon binary. `src/main.rs` (clap CLI + daemon), `config.rs`, `provider.rs` (Provider trait + registry), `queue.rs` (Postgres job queue), `gutenberg_org/` (mirror / rdf / feed / taxonomy).
+- **`crates/bookshelf-api`** — serde-only wire DTOs shared by every frontend shell and its server; must compile to wasm32, so no sqlx/tokio here.
+- **`crates/bookshelf-ui`** — the Leptos CSR front end (wasm bundle; data only via the JSON API, never the DB). `load.rs` explains the `spawn_local` + epoch pattern used instead of leptos `Resource` (Send bounds).
+- **`crates/librarian-web`** — read-only web shell: axum `/api` + static UI from `static/` (bundle built by xtask) + cover/file streaming out of `library_dir` (canonicalized traversal guard). Never migrates; safe beside a running daemon.
+- **`crates/xtask`** — cargo-native build orchestration: `cargo run -p xtask -- dist` builds the wasm bundle via `wasm-bindgen-cli` (CLI version must equal the `wasm-bindgen` crate pin).
 
 Core flows:
 
@@ -41,7 +45,10 @@ Non-negotiable invariants (do not "fix" these):
 | `crates/*/tests/` | Integration tests + `librarian/tests/fixtures/` |
 | `library/` | Default `library_dir` target — currently empty. **A default-config daemon starts a ~230 GB backfill (1–3 days). Never run disk-touching commands without an explicit small `--config`.** |
 | `library-smoke/` | Gitignored, live rsync-pulled smoke fixture (~2–3 GB, server mtimes). Read-only ground truth for eyeballing; assertions never touch it. |
-| `docker/` | Container config (`library_dir = /data` only) |
+| `docker/` | Container configs: daemon image (root `Dockerfile`), web image (`web.Dockerfile`), container tomls |
+| `crates/bookshelf-api/src/` | Wire DTOs (`BookHit`, `Stats`, `CategoryGroup`, `BookDetail`, …) |
+| `crates/bookshelf-ui/src/` | Leptos pages (home/search/categories/book) + `api.rs` client + `load.rs` |
+| `crates/librarian-web/` | Server: `src/api.rs` (JSON + streaming), `src/config.rs`, `static/` (index.html, style.css, fonts, generated `pkg/`) |
 
 ## Development Commands
 
@@ -51,10 +58,12 @@ BOOKSHELF_DATABASE_URL=postgres://… cargo test   # + store/queue integration t
 cargo test -p librarian --test rdf_parse parses_pg1342_exactly   # single test
 cargo run -p librarian -- status             # DB state via same URL
 cargo run -p librarian -- daemon --config librarian-smoke.toml   # smoke (small, feed off, no backfill)
+cargo run -p xtask -- dist              # build the wasm UI bundle into librarian-web/static/pkg/
+cargo run -p librarian-web -- --config librarian-smoke.toml   # serve http://127.0.0.1:8787
+docker compose up -d --build                 # postgres:16 + librarian daemon + librarian-web
 cargo build --release --locked -p librarian
 cargo install --path crates/librarian
 cargo fmt                                    # formats rust code
-docker compose up -d --build                 # postgres:16 + librarian daemon
 ```
 
 No CI exists — verification is the manual loop above. No rustfmt/clippy config committed; match surrounding style.
@@ -64,7 +73,7 @@ No CI exists — verification is the manual loop above. No rustfmt/clippy config
 - **Errors**: `anyhow` throughout; `FetchError` (in `adapters/http.rs`) carries status / Retry-After / headers / 500-byte body head so triage stays deterministic. EventLog errors are logged, never propagated.
 - **Async**: tokio multi-thread; blocking work behind `spawn_blocking`; concurrency bounded by semaphores, never unbounded spawns.
 - **sqlx**: runtime `query`/`query_as` only — **no macros**, no compile-time `DATABASE_URL`, no `.sqlx` cache. `FromRow` derive only. Migrations embedded via `sqlx::migrate!` and auto-applied by every subcommand (`open_store`, `main.rs:134-136`); idempotent via `_sqlx_migrations`.
-- **Dependencies**: exact `=` pins, hand-duplicated across both crate manifests (no `[workspace.dependencies]`) — a version bump must edit **both** manifests + `cargo update -p <crate>`. Feature `agent` (default) gates `rig-core`.
+- **Dependencies**: exact `=` pins, hand-duplicated across crate manifests (no `[workspace.dependencies]`) — a version bump edits every manifest that names the crate + `cargo update -p <crate>`. Feature `agent` (default, core + librarian only) gates `rig-core`. `wasm-bindgen-cli` (installed tool) must match the `wasm-bindgen` crate pin in `bookshelf-ui`.
 - **Config** (`crates/librarian/src/config.rs`): `ConfigFile` is `#[serde(deny_unknown_fields)]` — adding a key means adding the struct field or every run with the old file fails. Search order `--config` → `$BOOKSHELF_CONFIG` → `./librarian.toml`; env `BOOKSHELF_DATABASE_URL` always overrides the file; `~` expanded; derived paths (`mirror_dir`, `meta_dir`, `events_path`) are never file-settable.
 - **Naming**: event kinds are dot-namespaced verbs (`book.discovered`, `file.transferred`, `feed.checked`, …); provider module `gutenberg_org` vs source key `project-gutenberg`; DB rows all carry `source`.
 - **Commits**: `<binary>: <imperative lowercase summary>` + structured body (see `git log`).
@@ -89,7 +98,8 @@ No CI exists — verification is the manual loop above. No rustfmt/clippy config
 
 ## Testing & QA
 
-- 22 tests: per-crate integration tests in `crates/*/tests/` (RDF parse vs verbatim `fixtures/pg1342.rdf`, feed, itemize, triage ladder, taxonomy, event log, queue semantics) + 2 inline unit tests (`triage_agent.rs:211-240`, reply parsing).
+- 23 tests: per-crate integration tests in `crates/*/tests/` (RDF parse vs verbatim `fixtures/pg1342.rdf`, feed, itemize, triage ladder, taxonomy, event log, queue semantics, catalog reads `catalog_reads.rs`) + 2 inline unit tests (`triage_agent.rs:211-240`, reply parsing).
+- Web tier: `cargo run -p xtask -- dist` then `cargo run -p librarian-web -- --config librarian-smoke.toml`; verify pages at http://127.0.0.1:8787 (home search, category shelves, book page). The wasm bundle needs `rustup target add wasm32-unknown-unknown` + matching `wasm-bindgen-cli`.
 - Fixtures live in `crates/librarian/tests/fixtures/` and load via `CARGO_MANIFEST_DIR`-relative paths (not `include_str!`); parser tests elsewhere use inline `const LINES` arrays.
 - **DB-gated tests self-skip** by early `return` when `BOOKSHELF_DATABASE_URL` is unset — they are not `#[ignore]`d and pass vacuously without the var. They also **mutate the DB they point at** (probe rows `source='store-test'`, job-kind deletes): point them at a scratch DB.
 - Smoke tier: run the real binary with `librarian-smoke.toml`, verify by reading `library-smoke/events.jsonl` — no assertions involved.

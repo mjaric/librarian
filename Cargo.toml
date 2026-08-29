@@ -1,3 +1,10 @@
 [workspace]
-members = ["crates/bookshelf-core", "crates/librarian"]
+members = [
+  "crates/bookshelf-core",
+  "crates/librarian",
+  "crates/bookshelf-api",
+  "crates/bookshelf-ui",
+  "crates/librarian-web",
+  "crates/xtask",
+]
 resolver = "3"

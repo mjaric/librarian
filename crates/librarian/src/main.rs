@@ -14,7 +14,7 @@ use bookshelf_core::{EventLog, InterruptFlag, StorePostgres};
 
 use librarian::config::Config;
 use librarian::gutenberg_org::GutenbergOrg;
-use librarian::provider::{ensure_known_key, resolve, CycleOpts, Provider};
+use librarian::provider::{CycleOpts, Provider, ensure_known_key, resolve};
 use librarian::queue::JobQueue;
 use librarian::trigger::Trigger;
 
@@ -142,9 +142,9 @@ fn build_providers(
     events: Arc<EventLog>,
     interrupt: InterruptFlag,
 ) -> anyhow::Result<Vec<Arc<dyn Provider>>> {
-    Ok(vec![Arc::new(GutenbergOrg::new(
-        cfg, store, events, interrupt,
-    )?) as Arc<dyn Provider>])
+    Ok(vec![
+        Arc::new(GutenbergOrg::new(cfg, store, events, interrupt)?) as Arc<dyn Provider>,
+    ])
 }
 
 #[tokio::main]
@@ -171,7 +171,12 @@ async fn main() -> anyhow::Result<()> {
             let store = open_store(&cfg).await?;
             ensure_known_key(&provider)?;
             let queue = JobQueue::new(store.pool().clone());
-            let opts = CycleOpts { feed, limit, only: only.clone(), no_ingest };
+            let opts = CycleOpts {
+                feed,
+                limit,
+                only: only.clone(),
+                no_ingest,
+            };
             let kind = if feed { "feed_cycle" } else { "full_cycle" };
             let id = queue
                 .enqueue(&provider, kind, &serde_json::to_value(&opts)?, Trigger::Cli)
@@ -182,7 +187,11 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Cmd::Repair { only, wait, provider } => {
+        Cmd::Repair {
+            only,
+            wait,
+            provider,
+        } => {
             let store = open_store(&cfg).await?;
             ensure_known_key(&provider)?;
             let queue = JobQueue::new(store.pool().clone());
@@ -201,8 +210,7 @@ async fn main() -> anyhow::Result<()> {
             full_days,
             provider,
         } => {
-            let mut cfg = Arc::try_unwrap(cfg)
-                .map_err(|_| anyhow::anyhow!("config arc"))?; // sole owner here
+            let mut cfg = Arc::try_unwrap(cfg).map_err(|_| anyhow::anyhow!("config arc"))?; // sole owner here
             if let Some(fd) = feed_days {
                 cfg.feed_check_days = fd;
             }
@@ -223,8 +231,15 @@ async fn main() -> anyhow::Result<()> {
                 println!("  books {status}: {count}");
             }
             println!("  categories: {}", s.categories);
-            println!("  mirror files: {} ({:.2} GiB)", s.mirror_files, s.mirror_bytes as f64 / (1024.0 * 1024.0 * 1024.0));
-            println!("  repair pending: {}, failed: {}", s.repair_pending, s.repair_failed);
+            println!(
+                "  mirror files: {} ({:.2} GiB)",
+                s.mirror_files,
+                s.mirror_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+            );
+            println!(
+                "  repair pending: {}, failed: {}",
+                s.repair_pending, s.repair_failed
+            );
             if let Some(t) = s.min_retry_at {
                 println!("  min retry_at: {t}");
             }
@@ -257,7 +272,11 @@ async fn main() -> anyhow::Result<()> {
                     s.ingested,
                     s.total_remote,
                     s.synced,
-                    if s.total_remote > 0 { s.synced as f64 / s.total_remote as f64 * 100.0 } else { 0.0 },
+                    if s.total_remote > 0 {
+                        s.synced as f64 / s.total_remote as f64 * 100.0
+                    } else {
+                        0.0
+                    },
                     s.enriched,
                     s.failed_permanent,
                     s.mirror_files,
@@ -294,10 +313,9 @@ async fn wait_for_job(
 ) -> anyhow::Result<()> {
     // daemon heartbeat staleness check (warn once)
     if let Some(hb) = store.get_meta(provider, "daemon_heartbeat").await? {
-        if let Ok(t) = time::OffsetDateTime::parse(
-            &hb,
-            &time::format_description::well_known::Rfc3339,
-        ) {
+        if let Ok(t) =
+            time::OffsetDateTime::parse(&hb, &time::format_description::well_known::Rfc3339)
+        {
             let age = time::OffsetDateTime::now_utc() - t;
             if age.whole_seconds() > 15 {
                 eprintln!("warning: daemon not running — job stays queued (heartbeat {age:?} old)");
@@ -346,14 +364,18 @@ async fn run_daemon(cfg: Arc<Config>, provider_key: &str) -> anyhow::Result<()> 
         t.format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default()
     };
-    store.set_meta(source, "daemon_anchor", &rfc3339(now)).await?;
+    store
+        .set_meta(source, "daemon_anchor", &rfc3339(now))
+        .await?;
     if store.get_meta(source, "next_full_sync").await?.is_none() {
         let first = if cfg.backfill_on_start {
             now
         } else {
             now + time::Duration::days(cfg.full_sync_interval_days as i64)
         };
-        store.set_meta(source, "next_full_sync", &rfc3339(first)).await?;
+        store
+            .set_meta(source, "next_full_sync", &rfc3339(first))
+            .await?;
     }
 
     // -- signals
@@ -404,7 +426,13 @@ async fn run_daemon(cfg: Arc<Config>, provider_key: &str) -> anyhow::Result<()> 
             break;
         }
         if time::OffsetDateTime::now_utc() - last_heartbeat >= heartbeat_every {
-            store.set_meta(source, "daemon_heartbeat", &rfc3339(time::OffsetDateTime::now_utc())).await?;
+            store
+                .set_meta(
+                    source,
+                    "daemon_heartbeat",
+                    &rfc3339(time::OffsetDateTime::now_utc()),
+                )
+                .await?;
             last_heartbeat = time::OffsetDateTime::now_utc();
         }
         match queue.pick_next().await? {
@@ -457,17 +485,26 @@ struct JobSummary {
     aborted_reason: Option<String>,
 }
 
-async fn execute_job(provider: &dyn Provider, job: &librarian::queue::JobRow) -> anyhow::Result<JobSummary> {
+async fn execute_job(
+    provider: &dyn Provider,
+    job: &librarian::queue::JobRow,
+) -> anyhow::Result<JobSummary> {
     match job.kind.as_str() {
         "full_cycle" => {
             let opts: CycleOpts =
                 serde_json::from_value(job.payload.clone()).context("full_cycle payload")?;
             let r = provider.full_cycle(opts).await?;
-            Ok(JobSummary { run_id: r.run_id, aborted_reason: r.aborted_reason })
+            Ok(JobSummary {
+                run_id: r.run_id,
+                aborted_reason: r.aborted_reason,
+            })
         }
         "feed_cycle" => {
             let r = provider.feed_cycle().await?;
-            Ok(JobSummary { run_id: r.run_id, aborted_reason: r.aborted_reason })
+            Ok(JobSummary {
+                run_id: r.run_id,
+                aborted_reason: r.aborted_reason,
+            })
         }
         "repair" => {
             let only: Vec<i64> = job
@@ -475,9 +512,16 @@ async fn execute_job(provider: &dyn Provider, job: &librarian::queue::JobRow) ->
                 .get("only")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .unwrap_or_default();
-            let only_ref = if only.is_empty() { None } else { Some(&only[..]) };
+            let only_ref = if only.is_empty() {
+                None
+            } else {
+                Some(&only[..])
+            };
             let r = provider.repair(only_ref).await?;
-            Ok(JobSummary { run_id: r.run_id, aborted_reason: r.aborted_reason })
+            Ok(JobSummary {
+                run_id: r.run_id,
+                aborted_reason: r.aborted_reason,
+            })
         }
         other => anyhow::bail!("unknown job kind {other:?}"),
     }
@@ -500,12 +544,9 @@ async fn scheduler_tick(
         let due = match store.get_meta(source, "last_feed_check").await? {
             None => true,
             Some(last) => {
-                time::OffsetDateTime::parse(
-                    &last,
-                    &time::format_description::well_known::Rfc3339,
-                )
-                .map(|t| now - t >= time::Duration::days(cfg.feed_check_days as i64))
-                .unwrap_or(true)
+                time::OffsetDateTime::parse(&last, &time::format_description::well_known::Rfc3339)
+                    .map(|t| now - t >= time::Duration::days(cfg.feed_check_days as i64))
+                    .unwrap_or(true)
             }
         };
         if due {
@@ -533,7 +574,9 @@ async fn scheduler_tick(
                 // advance anchor regardless — a cycle already queued/running
                 // absorbs this due date (coalescing)
                 let advanced = now + time::Duration::days(cfg.full_sync_interval_days as i64);
-                store.set_meta(source, "next_full_sync", &rfc3339(advanced)).await?;
+                store
+                    .set_meta(source, "next_full_sync", &rfc3339(advanced))
+                    .await?;
             }
         }
     }

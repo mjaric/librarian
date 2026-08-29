@@ -11,10 +11,15 @@ async fn setup() -> Option<(JobQueue, std::sync::Arc<StorePostgres>)> {
     let store = StorePostgres::connect(&url).await.ok()?;
     store.migrate().await.ok()?;
     // clean slate for the kinds this test uses
-    let _ = bookshelf_core::sqlx::query("DELETE FROM jobs WHERE kind IN ('full_cycle','feed_cycle','repair')")
-        .execute(store.pool())
-        .await;
-    Some((JobQueue::new(store.pool().clone()), std::sync::Arc::new(store)))
+    let _ = bookshelf_core::sqlx::query(
+        "DELETE FROM jobs WHERE kind IN ('full_cycle','feed_cycle','repair')",
+    )
+    .execute(store.pool())
+    .await;
+    Some((
+        JobQueue::new(store.pool().clone()),
+        std::sync::Arc::new(store),
+    ))
 }
 
 #[tokio::test]
@@ -26,15 +31,28 @@ async fn schedule_outranks_cli_and_coalesces() {
 
     // cli job first, schedule job second — pickup must return the schedule job
     let cli_id = queue
-        .enqueue("project-gutenberg", "full_cycle", &serde_json::json!({}), Trigger::Cli)
+        .enqueue(
+            "project-gutenberg",
+            "full_cycle",
+            &serde_json::json!({}),
+            Trigger::Cli,
+        )
         .await
         .unwrap();
     let sched_id = queue
-        .enqueue("project-gutenberg", "full_cycle", &serde_json::json!({}), Trigger::Schedule)
+        .enqueue(
+            "project-gutenberg",
+            "full_cycle",
+            &serde_json::json!({}),
+            Trigger::Schedule,
+        )
         .await
         .unwrap();
     let picked = queue.pick_next().await.unwrap().expect("job picked");
-    assert_eq!(picked.id, sched_id, "schedule job must outrank the older cli job");
+    assert_eq!(
+        picked.id, sched_id,
+        "schedule job must outrank the older cli job"
+    );
     assert_eq!(picked.origin, "schedule");
     assert_eq!(picked.priority, 0);
 

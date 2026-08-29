@@ -53,6 +53,7 @@ cargo run -p librarian -- status             # DB state via same URL
 cargo run -p librarian -- daemon --config librarian-smoke.toml   # smoke (small, feed off, no backfill)
 cargo build --release --locked -p librarian
 cargo install --path crates/librarian
+cargo fmt                                    # formats rust code
 docker compose up -d --build                 # postgres:16 + librarian daemon
 ```
 

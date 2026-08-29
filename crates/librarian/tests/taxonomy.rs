@@ -4,7 +4,7 @@
 
 use std::collections::HashSet;
 
-use librarian::gutenberg_org::taxonomy::{category_leaves, seed_parent, strip_category, SEED};
+use librarian::gutenberg_org::taxonomy::{SEED, category_leaves, seed_parent, strip_category};
 
 #[test]
 fn seed_has_unique_leaves_and_nine_groups() {

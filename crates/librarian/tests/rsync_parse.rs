@@ -3,7 +3,7 @@
 //! bookshelf-core's parsed itemize output.
 
 use bookshelf_core::parse_itemize;
-use librarian::gutenberg_org::rdf::{parse_mirror_name, Format, MirrorEntry};
+use librarian::gutenberg_org::rdf::{Format, MirrorEntry, parse_mirror_name};
 
 const LINES: &[&str] = &[
     "<f.st......|1342/pg1342-images.epub|24846294",
@@ -33,10 +33,7 @@ fn maps_fixture_lines_to_books_and_formats() {
     // transfers: exactly the epub.images file for book 1342
     assert_eq!(transfers.len(), 1);
     assert_eq!(transfers[0].0, 1342);
-    assert_eq!(
-        transfers[0].1,
-        MirrorEntry::Format(Format::EpubImages)
-    );
+    assert_eq!(transfers[0].1, MirrorEntry::Format(Format::EpubImages));
     assert_eq!(transfers[0].2, 24846294);
 
     // ingest set: the rdf id

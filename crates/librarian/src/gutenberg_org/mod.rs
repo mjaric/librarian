@@ -8,17 +8,19 @@ pub mod mirror;
 pub mod rdf;
 pub mod taxonomy;
 
+use async_trait::async_trait;
+use bookshelf_core::domain::{EventKind, EventSink, Json, Triage};
+use bookshelf_core::triage_rules;
+use bookshelf_core::{FetchError, InterruptFlag, PoliteClient, RsyncRunner, StorePostgres};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
-use bookshelf_core::triage_rules;
-use bookshelf_core::{FetchError, InterruptFlag, PoliteClient, RsyncRunner, StorePostgres};
-use async_trait::async_trait;
-use bookshelf_core::domain::{EventKind, EventSink, Json, Triage};
 use time::OffsetDateTime;
 
 use crate::config::{Config, TriageMode};
-use crate::provider::{CycleOpts, CycleReport, ProgressReport, Provider, RepairReport, StatusReport};
+use crate::provider::{
+    CycleOpts, CycleReport, ProgressReport, Provider, RepairReport, StatusReport,
+};
 use mirror::{Mirror, PullResult};
 use rdf::MirrorEntry;
 
@@ -76,7 +78,9 @@ impl GutenbergOrg {
                 }
                 #[cfg(not(feature = "agent"))]
                 {
-                    tracing::warn!("triage=\"agent\" configured but the agent feature is off — using rules");
+                    tracing::warn!(
+                        "triage=\"agent\" configured but the agent feature is off — using rules"
+                    );
                     (None, None)
                 }
             }
@@ -166,7 +170,10 @@ impl GutenbergOrg {
         }
         if !pull.host_used.is_empty() {
             let host = pull.host_used.clone();
-            let _ = self.store.set_meta(SOURCE_KEY, "last_rsync_host", &host).await;
+            let _ = self
+                .store
+                .set_meta(SOURCE_KEY, "last_rsync_host", &host)
+                .await;
         }
     }
 
@@ -212,7 +219,11 @@ impl GutenbergOrg {
     }
 
     /// Returns Some(is_new) when the book was ingested, None when skipped.
-    async fn ingest_one(&self, id: i64, new_leaves: &mut Vec<String>) -> anyhow::Result<Option<bool>> {
+    async fn ingest_one(
+        &self,
+        id: i64,
+        new_leaves: &mut Vec<String>,
+    ) -> anyhow::Result<Option<bool>> {
         let rdf_path = self
             .cfg
             .mirror_dir()
@@ -345,9 +356,7 @@ impl GutenbergOrg {
                         )
                         .await?;
                     self.store
-                        .set_file_state(
-                            SOURCE_KEY, id, f.key(), "pending", None, None, None, None,
-                        )
+                        .set_file_state(SOURCE_KEY, id, f.key(), "pending", None, None, None, None)
                         .await?;
                 }
                 (None, Some(_)) => {
@@ -372,7 +381,10 @@ impl GutenbergOrg {
                     if created {
                         new_leaves.push((*leaf).to_string());
                     }
-                    self.store.get_category(SOURCE_KEY, leaf).await?.and_then(|c| c.parent)
+                    self.store
+                        .get_category(SOURCE_KEY, leaf)
+                        .await?
+                        .and_then(|c| c.parent)
                 }
             };
             if self.store.link_category(SOURCE_KEY, id, leaf).await? {
@@ -457,7 +469,6 @@ impl GutenbergOrg {
         recompute_book_status(&self.store, &self.events, &self.cfg, id, is_new).await
     }
 
-
     /// Shared tail of full/feed cycles: record pull, ingest, repair.
     /// `requested` = the ids the caller asked to pull (targeted/feed runs):
     /// they are ALWAYS (re-)ingested — ingest is idempotent, and a targeted
@@ -478,9 +489,7 @@ impl GutenbergOrg {
             ids.extend(pull.ingest_ids());
             ids.sort_unstable();
             ids.dedup();
-            let ids = if ids.is_empty()
-                && self.store.book_count(SOURCE_KEY).await? == 0
-            {
+            let ids = if ids.is_empty() && self.store.book_count(SOURCE_KEY).await? == 0 {
                 // first run: the pull was a full one — scan the mirror
                 self.scan_mirror_rdfs().await
             } else {
@@ -493,7 +502,11 @@ impl GutenbergOrg {
         if self.interrupt.is_set() {
             return Ok(());
         }
-        let only_slice = if requested.is_empty() { None } else { Some(requested) };
+        let only_slice = if requested.is_empty() {
+            None
+        } else {
+            Some(requested)
+        };
         let repair = self.repair_pass(only_slice).await?;
         if let Some(reason) = repair.aborted_reason.clone() {
             report.aborted_reason = Some(reason);
@@ -507,7 +520,10 @@ impl GutenbergOrg {
         loop {
             match self.http.fetch(&url).await {
                 Ok(resp) => {
-                    let xml = resp.text().await.map_err(|e| anyhow::anyhow!("feed body: {e}"))?;
+                    let xml = resp
+                        .text()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("feed body: {e}"))?;
                     return Ok(feed::parse_feed(&xml)?);
                 }
                 Err(e)
@@ -545,11 +561,18 @@ impl Provider for GutenbergOrg {
 
     async fn full_cycle(&self, opts: CycleOpts) -> anyhow::Result<CycleReport> {
         let run_id = self.store.start_run(SOURCE_KEY, "full").await?;
-        let mut report = CycleReport { run_id, ..Default::default() };
-        self.store.apply_category_seed(SOURCE_KEY, taxonomy::SEED).await?;
+        let mut report = CycleReport {
+            run_id,
+            ..Default::default()
+        };
+        self.store
+            .apply_category_seed(SOURCE_KEY, taxonomy::SEED)
+            .await?;
 
         if self.interrupt.is_set() {
-            self.store.finish_run(run_id, None, 0, 0, 0, 0, 0, 0, Some("interrupted")).await?;
+            self.store
+                .finish_run(run_id, None, 0, 0, 0, 0, 0, 0, Some("interrupted"))
+                .await?;
             report.aborted_reason = Some("interrupted".into());
             return Ok(report);
         }
@@ -575,14 +598,34 @@ impl Provider for GutenbergOrg {
 
         if pull.interrupted || self.interrupt.is_set() {
             self.store
-                .finish_run(run_id, pull.rsync_exit, pull.transferred_files, pull.transferred_bytes, 0, 0, 0, 0, Some("interrupted"))
+                .finish_run(
+                    run_id,
+                    pull.rsync_exit,
+                    pull.transferred_files,
+                    pull.transferred_bytes,
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some("interrupted"),
+                )
                 .await?;
             report.aborted_reason = Some("interrupted".into());
             return Ok(report);
         }
         if pull.failed {
             self.store
-                .finish_run(run_id, pull.rsync_exit, pull.transferred_files, pull.transferred_bytes, 0, 0, 0, 0, Some("rsync_failed"))
+                .finish_run(
+                    run_id,
+                    pull.rsync_exit,
+                    pull.transferred_files,
+                    pull.transferred_bytes,
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some("rsync_failed"),
+                )
                 .await?;
             report.aborted_reason = Some("rsync_failed".into());
             return Ok(report);
@@ -611,8 +654,13 @@ impl Provider for GutenbergOrg {
 
     async fn feed_cycle(&self) -> anyhow::Result<CycleReport> {
         let run_id = self.store.start_run(SOURCE_KEY, "feed").await?;
-        let mut report = CycleReport { run_id, ..Default::default() };
-        self.store.apply_category_seed(SOURCE_KEY, taxonomy::SEED).await?;
+        let mut report = CycleReport {
+            run_id,
+            ..Default::default()
+        };
+        self.store
+            .apply_category_seed(SOURCE_KEY, taxonomy::SEED)
+            .await?;
 
         let head = match self.fetch_feed().await {
             Ok(h) => h,
@@ -637,9 +685,23 @@ impl Provider for GutenbergOrg {
         report.transferred_bytes = pull.transferred_bytes;
 
         if pull.interrupted || self.interrupt.is_set() || pull.failed {
-            let reason = if pull.failed { "rsync_failed" } else { "interrupted" };
+            let reason = if pull.failed {
+                "rsync_failed"
+            } else {
+                "interrupted"
+            };
             self.store
-                .finish_run(run_id, pull.rsync_exit, pull.transferred_files, pull.transferred_bytes, 0, 0, 0, 0, Some(reason))
+                .finish_run(
+                    run_id,
+                    pull.rsync_exit,
+                    pull.transferred_files,
+                    pull.transferred_bytes,
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(reason),
+                )
                 .await?;
             report.aborted_reason = Some(reason.into());
             return Ok(report);
@@ -657,12 +719,16 @@ impl Provider for GutenbergOrg {
             }),
         )
         .await;
-        self.store.set_meta(SOURCE_KEY, "last_feed_pub_date", &head.pub_date).await?;
+        self.store
+            .set_meta(SOURCE_KEY, "last_feed_pub_date", &head.pub_date)
+            .await?;
         self.store
             .set_meta(
                 SOURCE_KEY,
                 "last_feed_check",
-                &OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+                &OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default(),
             )
             .await?;
 
@@ -757,8 +823,12 @@ impl Provider for GutenbergOrg {
 
     async fn progress(&self) -> anyhow::Result<ProgressReport> {
         let total_remote = self.mirror.total_books().await;
-        let by_status: std::collections::HashMap<String, i64> =
-            self.store.book_status_counts(SOURCE_KEY).await?.into_iter().collect();
+        let by_status: std::collections::HashMap<String, i64> = self
+            .store
+            .book_status_counts(SOURCE_KEY)
+            .await?
+            .into_iter()
+            .collect();
         let ingested: i64 = by_status.values().sum();
         let mirror = self.cfg.mirror_dir();
         let (files, bytes) = tokio::task::spawn_blocking(move || walk_dir(&mirror))
@@ -821,7 +891,10 @@ impl GutenbergOrg {
         };
         for f in done {
             let Some(rel) = &f.path else { continue };
-            if tokio::fs::try_exists(self.cfg.library_dir.join(rel)).await.unwrap_or(false) {
+            if tokio::fs::try_exists(self.cfg.library_dir.join(rel))
+                .await
+                .unwrap_or(false)
+            {
                 continue;
             }
             tracing::warn!(book = f.book_id, format = %f.format, "done file missing on disk — requeueing for repair");
@@ -878,7 +951,16 @@ impl GutenbergOrg {
                     if interrupt.is_set() || counters.lock().abort_reason.is_some() {
                         break;
                     }
-                    repair_one(&file, &store, &events, &http, &cfg, triage.as_deref(), &counters).await;
+                    repair_one(
+                        &file,
+                        &store,
+                        &events,
+                        &http,
+                        &cfg,
+                        triage.as_deref(),
+                        &counters,
+                    )
+                    .await;
                 }
             }));
         }
@@ -978,7 +1060,8 @@ async fn repair_one(
                             Some(t) => t.decide(&ctx).await,
                             None => bookshelf_core::domain::TriageDecision::Defer,
                         };
-                        apply_decision(file, store, events, cfg, counters, decision, "html_body").await;
+                        apply_decision(file, store, events, cfg, counters, decision, "html_body")
+                            .await;
                         return;
                     }
                     if let Some(exp) = expected {
@@ -1006,7 +1089,11 @@ async fn repair_one(
                     }
                     // atomic .part + rename into the mirror
                     let rel = file.path.clone().unwrap_or_else(|| {
-                        format!("mirror/{}/{}", file.book_id, mirror_name_for(&file.format, file.book_id))
+                        format!(
+                            "mirror/{}/{}",
+                            file.book_id,
+                            mirror_name_for(&file.format, file.book_id)
+                        )
                     });
                     let abs = cfg.library_dir.join(&rel);
                     if let Some(parent) = abs.parent() {
@@ -1064,7 +1151,17 @@ async fn repair_one(
             }
         }
         Err(e) => {
-            fail_ladder(file, store, events, cfg, triage, counters, &e, &e.to_string()).await;
+            fail_ladder(
+                file,
+                store,
+                events,
+                cfg,
+                triage,
+                counters,
+                &e,
+                &e.to_string(),
+            )
+            .await;
         }
     }
 }
@@ -1161,12 +1258,7 @@ async fn apply_decision(
                     }),
                 );
                 let _ = store
-                    .set_book_status(
-                        SOURCE_KEY,
-                        file.book_id,
-                        "failed_permanent",
-                        Some(&label),
-                    )
+                    .set_book_status(SOURCE_KEY, file.book_id, "failed_permanent", Some(&label))
                     .await;
                 emit(
                     events,
@@ -1338,15 +1430,26 @@ async fn recompute_book_status(
     };
     if all_terminal {
         if status != bookshelf_core::domain::BookStatus::Synced {
-            store.set_book_status(SOURCE_KEY, id, "synced", None).await?;
-            emit(events, EventKind::BookSynced, Some(id), serde_json::json!({}));
+            store
+                .set_book_status(SOURCE_KEY, id, "synced", None)
+                .await?;
+            emit(
+                events,
+                EventKind::BookSynced,
+                Some(id),
+                serde_json::json!({}),
+            );
             write_sidecar(store, cfg, id).await;
         }
     } else if is_new {
-        store.set_book_status(SOURCE_KEY, id, "enriched", None).await?;
+        store
+            .set_book_status(SOURCE_KEY, id, "enriched", None)
+            .await?;
     } else if status == bookshelf_core::domain::BookStatus::Synced {
         // a format went non-terminal again (e.g. updated upstream)
-        store.set_book_status(SOURCE_KEY, id, "enriched", None).await?;
+        store
+            .set_book_status(SOURCE_KEY, id, "enriched", None)
+            .await?;
     }
     Ok(())
 }
@@ -1356,7 +1459,10 @@ async fn write_sidecar(store: &Arc<StorePostgres>, cfg: &Arc<Config>, id: i64) {
     let Some(book) = store.get_book(SOURCE_KEY, id).await.ok().flatten() else {
         return;
     };
-    let cats = store.book_categories(SOURCE_KEY, id).await.unwrap_or_default();
+    let cats = store
+        .book_categories(SOURCE_KEY, id)
+        .await
+        .unwrap_or_default();
     let files = store.get_files(SOURCE_KEY, id).await.unwrap_or_default();
     let file_map: serde_json::Map<String, Json> = files
         .into_iter()

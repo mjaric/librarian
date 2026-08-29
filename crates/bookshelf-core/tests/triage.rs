@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use bookshelf_core::adapters::triage_rules::{decide, ladder_step, LadderStep};
+use bookshelf_core::adapters::triage_rules::{LadderStep, decide, ladder_step};
 use bookshelf_core::domain::TriageDecision;
 use bookshelf_core::{FetchError, FetchErrorKind};
 

@@ -5,10 +5,10 @@
 //! appends of lines smaller than PIPE_BUF are atomic on Linux, and the mutex
 //! serializes our own writers.
 
+use parking_lot::Mutex;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
-use parking_lot::Mutex;
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -31,7 +31,9 @@ impl EventLog {
             .append(true)
             .open(path)
             .with_context(|| format!("opening event log {}", path.display()))?;
-        Ok(Self { file: Mutex::new(file) })
+        Ok(Self {
+            file: Mutex::new(file),
+        })
     }
 
     /// Write one event line + flush. Blocking; cheap enough for 76k-book runs.

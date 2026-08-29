@@ -1,11 +1,10 @@
 //! Parse the pg1342.rdf fixture (verbatim from www.gutenberg.org) and assert
 //! every extracted field exactly.
 
-use librarian::gutenberg_org::rdf::{parse_mirror_name, parse_rdf, Format, MirrorEntry};
+use librarian::gutenberg_org::rdf::{Format, MirrorEntry, parse_mirror_name, parse_rdf};
 
 fn fixture() -> String {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/pg1342.rdf");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pg1342.rdf");
     std::fs::read_to_string(&path).unwrap()
 }
 
@@ -22,8 +21,18 @@ fn parses_pg1342_exactly() {
     assert_eq!(book.publisher.as_deref(), Some("Project Gutenberg"));
     assert_eq!(book.rights.as_deref(), Some("Public domain in the USA."));
     assert_eq!(book.downloads, Some(183505));
-    assert!(book.description.as_deref().unwrap().contains("automatically generated summary"));
-    assert!(book.reading_ease.as_deref().unwrap().contains("Reading ease score: 69.2"));
+    assert!(
+        book.description
+            .as_deref()
+            .unwrap()
+            .contains("automatically generated summary")
+    );
+    assert!(
+        book.reading_ease
+            .as_deref()
+            .unwrap()
+            .contains("Reading ease score: 69.2")
+    );
 
     // authors
     assert_eq!(book.authors.len(), 1);
@@ -47,7 +56,11 @@ fn parses_pg1342_exactly() {
     );
 
     // subjects: 7 LCSH + 1 LCC
-    let lcsh: Vec<_> = book.subjects.iter().filter(|s| s.scheme == "LCSH").collect();
+    let lcsh: Vec<_> = book
+        .subjects
+        .iter()
+        .filter(|s| s.scheme == "LCSH")
+        .collect();
     let lcc: Vec<_> = book.subjects.iter().filter(|s| s.scheme == "LCC").collect();
     assert_eq!(lcsh.len(), 7);
     assert_eq!(lcc.len(), 1);
@@ -86,12 +99,8 @@ fn parses_pg1342_exactly() {
 
 #[test]
 fn epub3_images_is_not_epub_images() {
-    assert!(Format::EpubImages.matches_url(
-        "https://www.gutenberg.org/ebooks/1342.epub.images"
-    ));
-    assert!(!Format::EpubImages.matches_url(
-        "https://www.gutenberg.org/ebooks/1342.epub3.images"
-    ));
+    assert!(Format::EpubImages.matches_url("https://www.gutenberg.org/ebooks/1342.epub.images"));
+    assert!(!Format::EpubImages.matches_url("https://www.gutenberg.org/ebooks/1342.epub3.images"));
 }
 
 #[test]

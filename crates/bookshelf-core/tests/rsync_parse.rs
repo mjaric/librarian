@@ -1,6 +1,6 @@
 //! Fixture itemize lines (`%i|%n|%b`) → parsed structure + exit-class table.
 
-use bookshelf_core::{classify_exit, parse_itemize, ExitClass};
+use bookshelf_core::{ExitClass, classify_exit, parse_itemize};
 
 const LINES: &[&str] = &[
     "<f.st......|1342/pg1342-images.epub|24846294",

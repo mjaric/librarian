@@ -138,10 +138,12 @@ impl StorePostgres {
     }
 
     pub async fn book_count(&self, source: &str) -> anyhow::Result<i64> {
-        Ok(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM books WHERE source = $1")
-            .bind(source)
-            .fetch_one(&self.pool)
-            .await?)
+        Ok(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM books WHERE source = $1")
+                .bind(source)
+                .fetch_one(&self.pool)
+                .await?,
+        )
     }
 
     /// Insert a new book. Returns false when the row already existed.
@@ -220,11 +222,12 @@ impl StorePostgres {
     }
 
     pub async fn book_status_counts(&self, source: &str) -> anyhow::Result<Vec<(String, i64)>> {
-        let rows: Vec<(String, i64)> =
-            sqlx::query_as("SELECT status, count(*) FROM books WHERE source = $1 GROUP BY status ORDER BY status")
-                .bind(source)
-                .fetch_all(&self.pool)
-                .await?;
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT status, count(*) FROM books WHERE source = $1 GROUP BY status ORDER BY status",
+        )
+        .bind(source)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows)
     }
 
@@ -455,13 +458,14 @@ impl StorePostgres {
         book_id: i64,
         category: &str,
     ) -> anyhow::Result<bool> {
-        let res =
-            sqlx::query("DELETE FROM book_categories WHERE source = $1 AND book_id = $2 AND category = $3")
-                .bind(source)
-                .bind(book_id)
-                .bind(category)
-                .execute(&self.pool)
-                .await?;
+        let res = sqlx::query(
+            "DELETE FROM book_categories WHERE source = $1 AND book_id = $2 AND category = $3",
+        )
+        .bind(source)
+        .bind(book_id)
+        .bind(category)
+        .execute(&self.pool)
+        .await?;
         Ok(res.rows_affected() == 1)
     }
 
@@ -496,7 +500,6 @@ impl StorePostgres {
         Ok(rows)
     }
 
-
     /// Requeue jobs stuck in `running` (daemon died mid-job). Returns count.
     pub async fn reclaim_running_jobs(&self) -> anyhow::Result<u64> {
         let res = sqlx::query("UPDATE jobs SET status = 'queued' WHERE status = 'running'")
@@ -524,7 +527,6 @@ pub struct NewBook<'a> {
     pub bookshelves: &'a crate::domain::Json,
     pub status: &'a str,
 }
-
 
 impl StorePostgres {
     /// All `done` file rows (source-scoped, optionally book-filtered) — the

@@ -107,7 +107,6 @@ impl JobQueue {
         Ok(id)
     }
 
-
     /// Atomically claim the next queued job: priority ASC, enqueued_at ASC,
     /// FOR UPDATE SKIP LOCKED.
     pub async fn pick_next(&self) -> anyhow::Result<Option<JobRow>> {

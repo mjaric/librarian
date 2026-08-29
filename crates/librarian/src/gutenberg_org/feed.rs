@@ -3,8 +3,8 @@
 //! entries. Every listed id is returned — the feed includes updates of OLD
 //! books, so each id is re-checked.
 
-use quick_xml::events::Event;
 use quick_xml::Reader;
+use quick_xml::events::Event;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeedHead {
@@ -19,7 +19,10 @@ pub fn parse_feed(xml: &str) -> anyhow::Result<FeedHead> {
     reader.config_mut().trim_text(true);
     let mut buf = Vec::new();
 
-    let mut head = FeedHead { pub_date: String::new(), ids: Vec::new() };
+    let mut head = FeedHead {
+        pub_date: String::new(),
+        ids: Vec::new(),
+    };
     let mut in_item = false;
     let mut in_pubdate = false;
     let mut text = String::new();
@@ -78,8 +81,11 @@ pub fn parse_feed(xml: &str) -> anyhow::Result<FeedHead> {
 
     // Validate the date shape (RFC 2822) without keeping the parsed value.
     if !head.pub_date.is_empty() {
-        time::OffsetDateTime::parse(&head.pub_date, &time::format_description::well_known::Rfc2822)
-            .map_err(|e| anyhow::anyhow!("feed pubDate {:?} not RFC2822: {e}", head.pub_date))?;
+        time::OffsetDateTime::parse(
+            &head.pub_date,
+            &time::format_description::well_known::Rfc2822,
+        )
+        .map_err(|e| anyhow::anyhow!("feed pubDate {:?} not RFC2822: {e}", head.pub_date))?;
     }
     Ok(head)
 }

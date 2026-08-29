@@ -31,10 +31,22 @@ pub const SEED: &[(&str, &str, i32)] = &[
     ("Science & Technology", "Engineering & Technology", 671),
     ("Science & Technology", "Mathematics", 672),
     ("Science & Technology", "Science - Physics", 667),
-    ("Science & Technology", "Science - Chemistry/Biochemistry", 668),
+    (
+        "Science & Technology",
+        "Science - Chemistry/Biochemistry",
+        668,
+    ),
     ("Science & Technology", "Science - Biology", 669),
-    ("Science & Technology", "Science - Earth/Agricultural/Farming", 670),
-    ("Science & Technology", "Research Methods/Statistics/Information Sys", 673),
+    (
+        "Science & Technology",
+        "Science - Earth/Agricultural/Farming",
+        670,
+    ),
+    (
+        "Science & Technology",
+        "Research Methods/Statistics/Information Sys",
+        673,
+    ),
     ("Science & Technology", "Environmental Issues", 685),
     // History
     ("History", "History - American", 656),
@@ -54,11 +66,19 @@ pub const SEED: &[(&str, &str, i32)] = &[
     ("Social Sciences & Society", "Business/Management", 695),
     ("Social Sciences & Society", "Economics", 696),
     ("Social Sciences & Society", "Law & Criminology", 689),
-    ("Social Sciences & Society", "Gender & Sexuality Studies", 690),
+    (
+        "Social Sciences & Society",
+        "Gender & Sexuality Studies",
+        690,
+    ),
     ("Social Sciences & Society", "Psychiatry/Psychology", 688),
     ("Social Sciences & Society", "Sociology", 693),
     ("Social Sciences & Society", "Politics", 694),
-    ("Social Sciences & Society", "Parenthood & Family Relations", 701),
+    (
+        "Social Sciences & Society",
+        "Parenthood & Family Relations",
+        701,
+    ),
     ("Social Sciences & Society", "Old Age & the Elderly", 700),
     // Arts & Culture
     ("Arts & Culture", "Art", 675),
@@ -83,9 +103,17 @@ pub const SEED: &[(&str, &str, i32)] = &[
     ("Health & Medicine", "Drugs/Alcohol/Pharmacology", 682),
     ("Health & Medicine", "Nutrition", 684),
     // Education & Reference
-    ("Education & Reference", "Encyclopedias/Dictionaries/Reference", 697),
+    (
+        "Education & Reference",
+        "Encyclopedias/Dictionaries/Reference",
+        697,
+    ),
     ("Education & Reference", "Teaching & Education", 704),
-    ("Education & Reference", "Reports & Conference Proceedings", 702),
+    (
+        "Education & Reference",
+        "Reports & Conference Proceedings",
+        702,
+    ),
     ("Education & Reference", "Journals", 699),
 ];
 
@@ -104,4 +132,3 @@ pub fn seed_parent(leaf: &str) -> Option<&'static str> {
 pub fn category_leaves(shelves: &[String]) -> Vec<&str> {
     shelves.iter().filter_map(|s| strip_category(s)).collect()
 }
-

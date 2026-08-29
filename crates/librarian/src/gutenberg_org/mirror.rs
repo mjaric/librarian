@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bookshelf_core::{parse_itemize, ExitClass, InterruptFlag, RsyncRunner};
-use super::rdf::{parse_mirror_name, Format, MirrorEntry};
+use super::rdf::{Format, MirrorEntry, parse_mirror_name};
+use bookshelf_core::{ExitClass, InterruptFlag, RsyncRunner, parse_itemize};
 
 pub const FALLBACK_HOST: &str = "rsync.ibiblio.org";
 
@@ -66,7 +66,10 @@ impl Mirror {
 
     /// Filter list: book dirs, rdf, and one pattern per selected format.
     fn include_args(&self) -> Vec<String> {
-        let mut args = vec!["--include=/*/".to_string(), "--include=/*/pg[0-9]*.rdf".to_string()];
+        let mut args = vec![
+            "--include=/*/".to_string(),
+            "--include=/*/pg[0-9]*.rdf".to_string(),
+        ];
         for f in &self.formats {
             let pattern = match f {
                 Format::Txt => "/*/pg[0-9]*.txt",
@@ -121,7 +124,8 @@ impl Mirror {
     pub async fn full_pull(&self) -> PullResult {
         let primary = self.full_args(&self.primary_host);
         let fallback = self.full_args(FALLBACK_HOST);
-        self.run_ladder(vec![primary.clone(), fallback.clone(), primary, fallback]).await
+        self.run_ladder(vec![primary.clone(), fallback.clone(), primary, fallback])
+            .await
     }
 
     /// Targeted pull of specific book dirs over one connection
@@ -195,9 +199,9 @@ impl Mirror {
     async fn targeted_pull_batch(&self, ids: &[i64]) -> PullResult {
         let primary = self.targeted_args(&self.primary_host, ids);
         let fallback = self.targeted_args(FALLBACK_HOST, ids);
-        self.run_ladder(vec![primary.clone(), fallback.clone(), primary, fallback]).await
+        self.run_ladder(vec![primary.clone(), fallback.clone(), primary, fallback])
+            .await
     }
-
 
     /// First `n` book ids from a module listing (one connection, no file
     /// transfer). Empty on connection failure after host fallback.
@@ -221,7 +225,10 @@ impl Mirror {
                     let mut it = line.split_whitespace();
                     let perms = it.next().unwrap_or_default();
                     let name = it.next_back().unwrap_or_default();
-                    if perms.starts_with('d') && name.bytes().all(|b| b.is_ascii_digit()) && !name.is_empty() {
+                    if perms.starts_with('d')
+                        && name.bytes().all(|b| b.is_ascii_digit())
+                        && !name.is_empty()
+                    {
                         if let Ok(id) = name.parse::<i64>() {
                             ids.insert(id);
                         }
@@ -274,7 +281,9 @@ impl Mirror {
                 Some(ExitClass::Ok) | Some(ExitClass::Partial) => {
                     self.absorb(&mut result, &outcome);
                     if outcome.class() == Some(ExitClass::Partial) {
-                        tracing::warn!("rsync partial transfer (files vanished upstream); keeping what arrived");
+                        tracing::warn!(
+                            "rsync partial transfer (files vanished upstream); keeping what arrived"
+                        );
                     }
                     return result;
                 }

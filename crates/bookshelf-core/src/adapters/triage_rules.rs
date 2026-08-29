@@ -49,7 +49,9 @@ fn from_ladder(attempts: u32) -> TriageDecision {
 /// The deterministic decision for one failed HTTP fetch.
 pub fn decide(err: &FetchError, attempts: u32) -> TriageDecision {
     match err.kind {
-        FetchErrorKind::Timeout | FetchErrorKind::Connect | FetchErrorKind::Body => from_ladder(attempts),
+        FetchErrorKind::Timeout | FetchErrorKind::Connect | FetchErrorKind::Body => {
+            from_ladder(attempts)
+        }
         FetchErrorKind::Status => match err.status.unwrap_or(0) {
             429 => {
                 // Honor the server's explicit Retry-After exactly (RFC 9110

@@ -131,7 +131,9 @@ pub fn by_provider(provider: &str, model_name: &str) -> anyhow::Result<Box<dyn T
 
 /// Pull the assistant text out of a completion response.
 #[cfg(feature = "agent")]
-fn extract_text(response: &rig_core::completion::CompletionResponse<impl serde::Serialize>) -> String {
+fn extract_text(
+    response: &rig_core::completion::CompletionResponse<impl serde::Serialize>,
+) -> String {
     use rig_core::message::AssistantContent;
     response
         .choice
@@ -187,10 +189,7 @@ impl<M: CompletionModelSync> Triage for AgentTriage<M> {
 pub trait CompletionModelSync: rig_core::completion::CompletionModel + Send + Sync {}
 
 #[cfg(feature = "agent")]
-impl<T> CompletionModelSync for T where
-    T: rig_core::completion::CompletionModel + Send + Sync
-{
-}
+impl<T> CompletionModelSync for T where T: rig_core::completion::CompletionModel + Send + Sync {}
 
 /// Without the `agent` feature there is nothing to consult: rules only.
 fn fallback_rules(ctx: &TriageContext) -> TriageDecision {

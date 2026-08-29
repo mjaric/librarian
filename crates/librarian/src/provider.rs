@@ -123,11 +123,8 @@ pub fn resolve<'a>(
     providers: &'a [Arc<dyn Provider>],
     key: &str,
 ) -> anyhow::Result<&'a Arc<dyn Provider>> {
-    providers
-        .iter()
-        .find(|p| p.key() == key)
-        .ok_or_else(|| {
-            let keys: Vec<&str> = providers.iter().map(|p| p.key()).collect();
-            anyhow::anyhow!("unknown provider {key:?} (available: {keys:?})")
-        })
+    providers.iter().find(|p| p.key() == key).ok_or_else(|| {
+        let keys: Vec<&str> = providers.iter().map(|p| p.key()).collect();
+        anyhow::anyhow!("unknown provider {key:?} (available: {keys:?})")
+    })
 }

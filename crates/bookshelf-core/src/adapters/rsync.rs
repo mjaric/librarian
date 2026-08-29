@@ -12,8 +12,8 @@
 
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -78,7 +78,11 @@ pub fn parse_itemize(line: &str) -> Option<ItemizeLine> {
     if name.is_empty() {
         return None;
     }
-    Some(ItemizeLine { itemize, name, bytes })
+    Some(ItemizeLine {
+        itemize,
+        name,
+        bytes,
+    })
 }
 
 /// Deterministic exit-code table.
@@ -132,7 +136,10 @@ impl RsyncRunner {
             .stderr(Stdio::null())
             .status()
             .context("rsync binary not found on PATH — install rsync (>= 3.x)")?;
-        anyhow::ensure!(probe.success(), "rsync --version failed with status {probe}");
+        anyhow::ensure!(
+            probe.success(),
+            "rsync --version failed with status {probe}"
+        );
         Ok(Self { flag })
     }
 

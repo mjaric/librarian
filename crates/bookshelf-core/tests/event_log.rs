@@ -1,8 +1,8 @@
 //! Append-only JSONL event log: 3 emits → 3 valid lines each tagged with the
 //! source; reopen-and-emit appends without truncation.
 
-use bookshelf_core::domain::{EventKind, EventSink};
 use bookshelf_core::EventLog;
+use bookshelf_core::domain::{EventKind, EventSink};
 
 #[tokio::test]
 async fn emits_valid_lines_and_appends() {
@@ -13,9 +13,27 @@ async fn emits_valid_lines_and_appends() {
 
     {
         let log = EventLog::open(&path).unwrap();
-        log.emit("project-gutenberg", EventKind::BookDiscovered, Some(1342), serde_json::json!({"title": "Pride and Prejudice"})).await;
-        log.emit("project-gutenberg", EventKind::FileTransferred, Some(1342), serde_json::json!({"format": "txt", "bytes": 772386})).await;
-        log.emit("project-gutenberg", EventKind::BookSynced, Some(1342), serde_json::json!({})).await;
+        log.emit(
+            "project-gutenberg",
+            EventKind::BookDiscovered,
+            Some(1342),
+            serde_json::json!({"title": "Pride and Prejudice"}),
+        )
+        .await;
+        log.emit(
+            "project-gutenberg",
+            EventKind::FileTransferred,
+            Some(1342),
+            serde_json::json!({"format": "txt", "bytes": 772386}),
+        )
+        .await;
+        log.emit(
+            "project-gutenberg",
+            EventKind::BookSynced,
+            Some(1342),
+            serde_json::json!({}),
+        )
+        .await;
     }
 
     let lines: Vec<String> = std::fs::read_to_string(&path)
@@ -36,7 +54,13 @@ async fn emits_valid_lines_and_appends() {
     // reopen and append — no truncation
     {
         let log = EventLog::open(&path).unwrap();
-        log.emit("project-gutenberg", EventKind::FeedChecked, None, serde_json::json!({"items": 0})).await;
+        log.emit(
+            "project-gutenberg",
+            EventKind::FeedChecked,
+            None,
+            serde_json::json!({"items": 0}),
+        )
+        .await;
     }
     let lines: Vec<String> = std::fs::read_to_string(&path)
         .unwrap()

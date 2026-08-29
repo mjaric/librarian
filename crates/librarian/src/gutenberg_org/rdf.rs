@@ -8,9 +8,9 @@
 //! `dcam:memberOf` URI tail), type, bookshelves, and `hasFormat` entries
 //! (URL + extent + modified) for our four formats.
 
+use quick_xml::NsReader;
 use quick_xml::events::Event;
 use quick_xml::name::ResolveResult;
-use quick_xml::NsReader;
 use serde::Serialize;
 
 pub const NS_PGTERMS: &[u8] = b"http://www.gutenberg.org/2009/pgterms/";
@@ -30,7 +30,12 @@ pub enum Format {
 }
 
 impl Format {
-    pub const ALL: [Format; 4] = [Format::Txt, Format::EpubImages, Format::HtmlZip, Format::Cover];
+    pub const ALL: [Format; 4] = [
+        Format::Txt,
+        Format::EpubImages,
+        Format::HtmlZip,
+        Format::Cover,
+    ];
 
     pub fn key(&self) -> &'static str {
         match self {
@@ -159,9 +164,9 @@ pub struct RdfBook {
 
 impl RdfBook {
     pub fn issued_date(&self) -> Option<time::Date> {
-        self.issued
-            .as_deref()
-            .and_then(|s| time::Date::parse(s, &time::format_description::well_known::Iso8601::DEFAULT).ok())
+        self.issued.as_deref().and_then(|s| {
+            time::Date::parse(s, &time::format_description::well_known::Iso8601::DEFAULT).ok()
+        })
     }
 
     pub fn format_entry(&self, f: Format) -> Option<&RdfFormat> {
@@ -458,7 +463,9 @@ fn attr_local(e: &quick_xml::events::BytesStart<'_>, want: &[u8]) -> Option<Stri
         })
         .and_then(|a| {
             let raw = String::from_utf8_lossy(a.value.as_ref());
-            quick_xml::escape::unescape(&raw).ok().map(|v| v.into_owned())
+            quick_xml::escape::unescape(&raw)
+                .ok()
+                .map(|v| v.into_owned())
         })
 }
 

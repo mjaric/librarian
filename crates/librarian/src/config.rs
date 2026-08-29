@@ -100,8 +100,7 @@ impl Config {
             Some(p) => {
                 let raw = std::fs::read_to_string(p)
                     .with_context(|| format!("reading config {}", p.display()))?;
-                toml::from_str(&raw)
-                    .with_context(|| format!("parsing config {}", p.display()))?
+                toml::from_str(&raw).with_context(|| format!("parsing config {}", p.display()))?
             }
             None => ConfigFile::default(),
         };
@@ -113,8 +112,11 @@ impl Config {
                 .map(|s| s.to_string())
                 .collect()
         }) {
-            let f = Format::parse_key(&key)
-                .with_context(|| format!("unknown format key {key:?} in config (want txt|epub.images|html.zip|cover)"))?;
+            let f = Format::parse_key(&key).with_context(|| {
+                format!(
+                    "unknown format key {key:?} in config (want txt|epub.images|html.zip|cover)"
+                )
+            })?;
             if !formats.contains(&f) {
                 formats.push(f);
             }
@@ -133,7 +135,9 @@ impl Config {
         Ok(Self {
             database_url,
             library_dir: expand_tilde(file.library_dir.unwrap_or_else(|| "./library".into())),
-            rsync_host: file.rsync_host.unwrap_or_else(|| "gutenberg.pglaf.org".into()),
+            rsync_host: file
+                .rsync_host
+                .unwrap_or_else(|| "gutenberg.pglaf.org".into()),
             rsync_module: file.rsync_module.unwrap_or_else(|| "gutenberg-epub".into()),
             download_host: file
                 .download_host

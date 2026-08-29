@@ -43,6 +43,35 @@ pub struct Mirror {
     dest: PathBuf,
     formats: Vec<Format>,
     interrupt: InterruptFlag,
+    /// Live counters for the current pull (reset per rsync attempt).
+    progress: RsyncProgress,
+    /// Host of the most recent rsync attempt (primary or fallback).
+    host: Arc<parking_lot::Mutex<Option<String>>>,
+}
+
+/// Clonable live view of the mirror's current pull, for observability
+/// consumers (the 5 s `active_run` publisher, metrics).
+#[derive(Clone)]
+pub struct MirrorLive {
+    progress: RsyncProgress,
+    host: Arc<parking_lot::Mutex<Option<String>>>,
+}
+
+impl MirrorLive {
+    /// `(files, bytes, last_item_unix_ms)` of the current rsync attempt.
+    pub fn snapshot(&self) -> (u64, u64, u64) {
+        self.progress.snapshot()
+    }
+
+    /// Cumulative `(files, bytes)` since process start — never reset by
+    /// `begin_pull`; the source for the monotonic rsync counters.
+    pub fn cumulative_snapshot(&self) -> (u64, u64) {
+        self.progress.cumulative_snapshot()
+    }
+
+    pub fn host(&self) -> Option<String> {
+        self.host.lock().clone()
+    }
 }
 
 impl Mirror {
@@ -61,6 +90,32 @@ impl Mirror {
             dest,
             formats,
             interrupt,
+            progress: RsyncProgress::new(),
+            host: Arc::new(parking_lot::Mutex::new(None)),
+        }
+    }
+
+    /// Reset the live counters at pull start so retries never leak old
+    /// numbers into observability.
+    pub fn begin_pull(&self) {
+        self.progress.reset();
+    }
+
+    /// Live `(files, bytes, last_item_unix_ms)`.
+    pub fn progress_snapshot(&self) -> (u64, u64, u64) {
+        self.progress.snapshot()
+    }
+
+    /// Host the most recent attempt ran against (None before the first).
+    pub fn host_snapshot(&self) -> Option<String> {
+        self.host.lock().clone()
+    }
+
+    /// Clonable handle for a background publisher task.
+    pub fn live(&self) -> MirrorLive {
+        MirrorLive {
+            progress: self.progress.clone(),
+            host: self.host.clone(),
         }
     }
 
@@ -122,6 +177,7 @@ impl Mirror {
 
     /// Weekly/first full pull over the whole module with `--delete`.
     pub async fn full_pull(&self) -> PullResult {
+        self.begin_pull();
         let primary = self.full_args(&self.primary_host);
         let fallback = self.full_args(FALLBACK_HOST);
         self.run_ladder(vec![primary.clone(), fallback.clone(), primary, fallback])
@@ -132,6 +188,7 @@ impl Mirror {
     /// (`--relative` with `/./` marking the destination cut). Falls back to
     /// one invocation per id when the daemon module mishandles multi-source.
     pub async fn targeted_pull(&self, ids: &[i64]) -> PullResult {
+        self.begin_pull();
         let mut result = self.targeted_pull_batch(ids).await;
         if result.failed && ids.len() > 1 {
             tracing::warn!("multi-source --relative pull failed; retrying per id");
@@ -169,9 +226,13 @@ impl Mirror {
                 format!("{host}::{}/", self.module),
             ];
             let runner = self.runner.clone();
-            let outcome = tokio::task::spawn_blocking(move || runner.run_blocking(&args))
-                .await
-                .unwrap_or_default();
+            // Listing connections produce no itemize lines; keep them off
+            // the live transfer counters with a throwaway progress.
+            let outcome = tokio::task::spawn_blocking(move || {
+                runner.run_blocking(&args, &RsyncProgress::default())
+            })
+            .await
+            .unwrap_or_default();
             if self.interrupt.is_set() {
                 return 0;
             }
@@ -212,9 +273,11 @@ impl Mirror {
                 format!("{host}::{}/", self.module),
             ];
             let runner = self.runner.clone();
-            let outcome = tokio::task::spawn_blocking(move || runner.run_blocking(&args))
-                .await
-                .unwrap_or_default();
+            let outcome = tokio::task::spawn_blocking(move || {
+                runner.run_blocking(&args, &RsyncProgress::default())
+            })
+            .await
+            .unwrap_or_default();
             if self.interrupt.is_set() {
                 return Vec::new();
             }
@@ -268,10 +331,13 @@ impl Mirror {
                 return result;
             }
             result.host_used = hosts[i % 2].to_string();
+            *self.host.lock() = Some(result.host_used.clone());
             let runner = self.runner.clone();
-            let outcome = tokio::task::spawn_blocking(move || runner.run_blocking(&args))
-                .await
-                .unwrap_or_default();
+            let progress = self.progress.clone();
+            let outcome =
+                tokio::task::spawn_blocking(move || runner.run_blocking(&args, &progress))
+                    .await
+                    .unwrap_or_default();
             result.rsync_exit = outcome.code.or(result.rsync_exit);
             if outcome.interrupted {
                 result.interrupted = true;

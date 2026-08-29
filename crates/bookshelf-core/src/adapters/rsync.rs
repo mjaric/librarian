@@ -13,7 +13,7 @@
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -123,6 +123,79 @@ impl RsyncOutcome {
     }
 }
 
+/// Cheap-clone live progress handle for one rsync invocation. The stdout
+/// reader thread feeds raw itemize lines to [`RsyncProgress::note`]; the
+/// daemon publishes snapshots every few seconds. All fields are atomics —
+/// reading never blocks the transfer.
+#[derive(Debug, Default, Clone)]
+pub struct RsyncProgress(Arc<ProgressInner>);
+
+#[derive(Debug, Default)]
+struct ProgressInner {
+    files: AtomicU64,
+    bytes: AtomicU64,
+    /// Unix epoch milliseconds of the last itemize line, 0 = none yet.
+    last_item_unix_ms: AtomicU64,
+    /// Monotonic totals since process start; [`RsyncProgress::reset`]
+    /// never touches these.
+    cum_files: AtomicU64,
+    cum_bytes: AtomicU64,
+}
+
+impl RsyncProgress {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Zero the per-attempt counters. `run_blocking` calls this at the
+    /// start of every attempt so retry ladders never double-count. The
+    /// cumulative totals ([`RsyncProgress::cumulative_snapshot`]) are
+    /// never touched — they are monotonic for the process lifetime.
+    pub fn reset(&self) {
+        self.0.files.store(0, Ordering::Relaxed);
+        self.0.bytes.store(0, Ordering::Relaxed);
+        self.0.last_item_unix_ms.store(0, Ordering::Relaxed);
+    }
+
+    /// Account one raw `%i|%n|%b` stdout line. Unparseable lines are
+    /// ignored. File transfers bump `files`/`bytes`; any parsed line
+    /// (including deletions and directory entries) refreshes the
+    /// last-item timestamp.
+    pub fn note(&self, raw_line: &str) {
+        let Some(line) = parse_itemize(raw_line) else {
+            return;
+        };
+        if line.is_file_transfer() {
+            self.0.files.fetch_add(1, Ordering::Relaxed);
+            self.0.bytes.fetch_add(line.bytes, Ordering::Relaxed);
+            self.0.cum_files.fetch_add(1, Ordering::Relaxed);
+            self.0.cum_bytes.fetch_add(line.bytes, Ordering::Relaxed);
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.0.last_item_unix_ms.store(now_ms, Ordering::Relaxed);
+    }
+
+    /// `(files, bytes, last_item_unix_ms)` — last is 0 when nothing arrived.
+    pub fn snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.0.files.load(Ordering::Relaxed),
+            self.0.bytes.load(Ordering::Relaxed),
+            self.0.last_item_unix_ms.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Cumulative `(files, bytes)` since process start. Never reset —
+    /// the source of truth for monotonic "downloaded total" metrics.
+    pub fn cumulative_snapshot(&self) -> (u64, u64) {
+        (
+            self.0.cum_files.load(Ordering::Relaxed),
+            self.0.cum_bytes.load(Ordering::Relaxed),
+        )
+    }
+}
+
 pub struct RsyncRunner {
     flag: InterruptFlag,
 }
@@ -144,10 +217,13 @@ impl RsyncRunner {
     }
 
     /// Run `rsync <args>` to completion, streaming stdout into the returned
-    /// outcome. Blocking — call from `spawn_blocking`. When the interrupt
-    /// flag is set mid-run the child's process group is TERMed, then KILLed
-    /// after 10 s, and `interrupted: true` is returned.
-    pub fn run_blocking(&self, args: &[String]) -> RsyncOutcome {
+    /// outcome. Blocking — call from `spawn_blocking`. Every attempt resets
+    /// `progress` first (retry ladders re-run `run_blocking` per attempt,
+    /// so counters reflect the current attempt, never an accumulation).
+    /// When the interrupt flag is set mid-run the child's process group is
+    /// TERMed, then KILLed after 10 s, and `interrupted: true` is returned.
+    pub fn run_blocking(&self, args: &[String], progress: &RsyncProgress) -> RsyncOutcome {
+        progress.reset();
         let mut outcome = RsyncOutcome::default();
         let mut child = match spawn_hygienic(args) {
             Ok(c) => c,
@@ -160,10 +236,13 @@ impl RsyncRunner {
 
         let stdout = child.stdout.take().expect("rsync stdout piped");
         let stderr = child.stderr.take().expect("rsync stderr piped");
+        // Owned clone for the reader thread (std::thread needs 'static).
+        let progress = progress.clone();
         let out_handle = std::thread::spawn(move || {
             let mut lines = Vec::new();
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                 tracing::debug!(target: "librarian::rsync", line = %line, "rsync");
+                progress.note(&line);
                 lines.push(line);
             }
             lines
@@ -238,4 +317,54 @@ fn kill_group(child: &mut Child, pgid: i32) {
         libc::kill(-pgid, libc::SIGKILL);
     }
     let _ = child.wait();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn note_counts_transfers_and_ignores_noise() {
+        let p = RsyncProgress::new();
+        p.note("<f.st......|1342/pg1342-images.epub|24846294");
+        p.note(">f+++++++++|51564/pg51564.rdf|18220");
+        // Unparseable lines are ignored (no separator, empty itemize).
+        p.note("sent 1,234 bytes  received 99 bytes");
+        p.note("");
+        let (files, bytes, last_ms) = p.snapshot();
+        assert_eq!(files, 2);
+        assert_eq!(bytes, 24_846_294 + 18_220);
+        assert!(last_ms > 0, "parsed lines must refresh the item timestamp");
+    }
+
+    #[test]
+    fn deletions_and_dirs_are_items_but_not_files() {
+        let p = RsyncProgress::new();
+        p.note("*deleting|1342/pg1342-h.zip|0");
+        p.note(".d..t......|1342/|0");
+        assert_eq!(p.snapshot().0, 0);
+        assert_eq!(p.snapshot().1, 0);
+        assert!(p.snapshot().2 > 0);
+    }
+
+    #[test]
+    fn reset_zeroes_counters() {
+        let p = RsyncProgress::new();
+        p.note(">f+++++++++|51564/pg51564.rdf|18220");
+        p.reset();
+        assert_eq!(p.snapshot(), (0, 0, 0));
+    }
+
+    #[test]
+    fn reset_keeps_cumulative_totals() {
+        let p = RsyncProgress::new();
+        p.note(">f+++++++++|51564/pg51564.rdf|18220");
+        p.reset();
+        // Per-attempt counters zero; cumulative pair is monotonic.
+        assert_eq!(p.snapshot(), (0, 0, 0));
+        assert_eq!(p.cumulative_snapshot(), (1, 18_220));
+        // The next attempt keeps growing the cumulative pair.
+        p.note(">f+++++++++|1342/pg1342.rdf|1000");
+        assert_eq!(p.cumulative_snapshot(), (2, 19_220));
+    }
 }

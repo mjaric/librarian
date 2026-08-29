@@ -69,6 +69,16 @@ impl StorePostgres {
         Ok(())
     }
 
+    /// Idempotent delete of one meta key (e.g. `active_run` on cycle exit).
+    pub async fn clear_meta(&self, source: &str, key: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM meta WHERE source = $1 AND key = $2")
+            .bind(source)
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     // -- sync runs ---------------------------------------------------------
 
     pub async fn start_run(&self, source: &str, cycle: &str) -> anyhow::Result<i64> {
@@ -126,6 +136,19 @@ impl StorePostgres {
         Ok(run)
     }
 
+    /// Recent runs for one source, newest first — including in-flight ones
+    /// (finished_at IS NULL; the CLI `runs` view renders those '· running').
+    pub async fn recent_runs(&self, source: &str, limit: i64) -> anyhow::Result<Vec<SyncRun>> {
+        let runs = sqlx::query_as::<_, SyncRun>(
+            "SELECT * FROM sync_runs WHERE source = $1 ORDER BY id DESC LIMIT $2",
+        )
+        .bind(source)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(runs)
+    }
+
     // -- books -----------------------------------------------------------
 
     pub async fn get_book(&self, source: &str, id: i64) -> anyhow::Result<Option<Book>> {
@@ -137,13 +160,15 @@ impl StorePostgres {
         Ok(book)
     }
 
-    pub async fn book_count(&self, source: &str) -> anyhow::Result<i64> {
-        Ok(
-            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM books WHERE source = $1")
+    /// All book ids for one source, ascending — the reconcile step diffs
+    /// this against the local mirror every cycle (~76k ids is fine).
+    pub async fn book_ids(&self, source: &str) -> anyhow::Result<Vec<i64>> {
+        let rows: Vec<(i64,)> =
+            sqlx::query_as("SELECT id FROM books WHERE source = $1 ORDER BY id")
                 .bind(source)
-                .fetch_one(&self.pool)
-                .await?,
-        )
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows.into_iter().map(|r| r.0).collect())
     }
 
     /// Insert a new book. Returns false when the row already existed.
@@ -224,6 +249,16 @@ impl StorePostgres {
     pub async fn book_status_counts(&self, source: &str) -> anyhow::Result<Vec<(String, i64)>> {
         let rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT status, count(*) FROM books WHERE source = $1 GROUP BY status ORDER BY status",
+        )
+        .bind(source)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    pub async fn file_status_counts(&self, source: &str) -> anyhow::Result<Vec<(String, i64)>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT status, count(*) FROM book_files WHERE source = $1 GROUP BY status ORDER BY status",
         )
         .bind(source)
         .fetch_all(&self.pool)

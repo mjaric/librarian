@@ -16,7 +16,8 @@ pub use sqlx;
 pub use adapters::event_log::EventLog;
 pub use adapters::http::{FetchError, FetchErrorKind, PoliteClient};
 pub use adapters::rsync::{
-    ExitClass, InterruptFlag, ItemizeLine, RsyncOutcome, RsyncRunner, classify_exit, parse_itemize,
+    ExitClass, InterruptFlag, ItemizeLine, RsyncOutcome, RsyncProgress, RsyncRunner, classify_exit,
+    parse_itemize,
 };
 pub use adapters::store_postgres::StorePostgres;
 pub use adapters::triage_rules;

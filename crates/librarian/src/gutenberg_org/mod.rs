@@ -124,28 +124,6 @@ impl GutenbergOrg {
         self.events.emit(SOURCE_KEY, kind, book_id, detail).await;
     }
 
-    /// Local scan of `mirror/*/pg*.rdf` (first run ingest set).
-    async fn scan_mirror_rdfs(&self) -> Vec<i64> {
-        let dir = self.cfg.mirror_dir();
-        let mut ids = Vec::new();
-        let mut entries = match tokio::fs::read_dir(&dir).await {
-            Ok(e) => e,
-            Err(_) => return ids,
-        };
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if !name.bytes().all(|b| b.is_ascii_digit()) || name.is_empty() {
-                continue;
-            }
-            if entry.path().join(format!("pg{name}.rdf")).is_file() {
-                ids.push(name.parse().unwrap_or(0));
-            }
-        }
-        ids.sort_unstable();
-        ids
-    }
-
     /// Events + book_files updates for a completed pull.
     async fn record_pull(&self, pull: &PullResult) {
         for t in &pull.transfers {
@@ -485,6 +463,9 @@ impl GutenbergOrg {
     /// `requested` = the ids the caller asked to pull (targeted/feed runs):
     /// they are ALWAYS (re-)ingested — ingest is idempotent, and a targeted
     /// pull with zero new transfers must still refresh state for those ids.
+    /// The ingest set is then reconciled against the mirror (self-healing:
+    /// interrupted cycles and drift heal on the next run; `reconcile=N` in
+    /// the log — N is large only on a first backfill).
     async fn cycle_tail(
         &self,
         pull: &PullResult,
@@ -503,12 +484,17 @@ impl GutenbergOrg {
             ids.extend(pull.ingest_ids());
             ids.sort_unstable();
             ids.dedup();
-            let ids = if ids.is_empty() && self.store.book_count(SOURCE_KEY).await? == 0 {
-                // first run: the pull was a full one — scan the mirror
-                self.scan_mirror_rdfs().await
-            } else {
-                ids
-            };
+            // Self-healing: every cycle diffs the mirror against the DB, so
+            // files an interrupted run delivered without an itemize (rsync
+            // mtime-delta will never re-list them) still enter the DB on
+            // the next run. On a fresh mirror this is the backfill itself.
+            let mirror_ids = scan_mirror_rdfs(&self.cfg.mirror_dir()).await;
+            let db_ids = self.store.book_ids(SOURCE_KEY).await?;
+            let reconciled = reconcile_ids(&mirror_ids, &db_ids, &ids);
+            tracing::info!(reconcile = reconciled.len(), "mirror-vs-DB reconcile");
+            ids.extend(reconciled);
+            ids.sort_unstable();
+            ids.dedup();
             guard.phase_attr("ids", ids.len() as i64);
             if !ids.is_empty() {
                 self.ingest(ids, report).await?;
@@ -1142,6 +1128,49 @@ fn walk_dir(root: &std::path::Path) -> (u64, u64) {
 }
 
 // ---------------------------------------------------------------------------
+// Mirror ↔ DB reconcile (self-healing ingest set)
+// ---------------------------------------------------------------------------
+
+/// Sorted ids with an `pg{id}.rdf` present in the local mirror (`dir` is
+/// the mirror root: one numeric subdir per book).
+async fn scan_mirror_rdfs(dir: &std::path::Path) -> Vec<i64> {
+    let mut ids = Vec::new();
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(e) => e,
+        Err(_) => return ids,
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.bytes().all(|b| b.is_ascii_digit()) || name.is_empty() {
+            continue;
+        }
+        if entry.path().join(format!("pg{name}.rdf")).is_file() {
+            ids.push(name.parse().unwrap_or(0));
+        }
+    }
+    ids.sort_unstable();
+    ids
+}
+
+/// Pure reconcile diff: ids present in `mirror` but missing from both the
+/// DB (`db`) and the already-planned set (`planned`, requested ∪ itemized)
+/// — sorted, deduped; input order and duplicates don't matter. Interrupted
+/// cycles heal here: files rsync delivered without an itemize (crash
+/// mid-pull) are picked up on the next run instead of never entering the DB.
+fn reconcile_ids(mirror: &[i64], db: &[i64], planned: &[i64]) -> Vec<i64> {
+    let known: HashSet<i64> = db.iter().chain(planned).copied().collect();
+    let mut out: Vec<i64> = mirror
+        .iter()
+        .copied()
+        .filter(|id| !known.contains(id))
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+// ---------------------------------------------------------------------------
 // HTTP repair pass (Step 7)
 // ---------------------------------------------------------------------------
 
@@ -1253,6 +1282,26 @@ impl GutenbergOrg {
     }
 }
 
+/// Stat-before-download for repair: the file's expected mirror path plus
+/// its on-disk size when a non-empty copy is already present. Interrupted
+/// predecessors can leave files behind without ever marking their row done
+/// (lost rsync itemize, crash before `set_file_done`) — those only need
+/// the marking, not another download.
+async fn stat_mirror_file(
+    library_dir: &std::path::Path,
+    file: &bookshelf_core::domain::BookFile,
+) -> Option<(String, u64)> {
+    let rel = file.path.clone().unwrap_or_else(|| {
+        format!(
+            "mirror/{}/{}",
+            file.book_id,
+            mirror_name_for(&file.format, file.book_id)
+        )
+    });
+    let meta = tokio::fs::metadata(library_dir.join(&rel)).await.ok()?;
+    (meta.is_file() && meta.len() > 0).then_some((rel, meta.len()))
+}
+
 /// Handle one repair item end-to-end.
 #[allow(clippy::too_many_arguments)]
 async fn repair_one(
@@ -1287,6 +1336,31 @@ async fn repair_one(
         return;
     };
 
+    // Stat-before-download: the mirror copy is authoritative (same as
+    // rsync-delivered files) — an interrupted predecessor may have left
+    // the file on disk without marking it done. Heal the row, skip HTTP.
+    if let Some((rel, bytes)) = stat_mirror_file(&cfg.library_dir, file).await {
+        let _ = store
+            .set_file_done(SOURCE_KEY, file.book_id, &file.format, &rel, None)
+            .await;
+        tracing::info!(
+            book = file.book_id,
+            format = %file.format,
+            bytes,
+            "repair skipped download (file present on disk)"
+        );
+        emit(
+            events,
+            EventKind::FileRepaired,
+            Some(file.book_id),
+            serde_json::json!({ "format": file.format, "path": rel, "bytes": bytes }),
+        );
+        let _ = recompute_book_status(store, events, cfg, file.book_id, false).await;
+        let mut c = counters.lock();
+        c.repaired += 1;
+        c.consecutive_retriable = 0;
+        return;
+    }
     let _permit = http.semaphore().acquire().await;
     match http.fetch(&url).await {
         Ok(resp) => {
@@ -1772,5 +1846,284 @@ async fn write_sidecar(store: &Arc<StorePostgres>, cfg: &Arc<Config>, id: i64) {
     let path = cfg.meta_dir().join(format!("{id}.json"));
     if let Err(e) = async_move_write(&path, &sidecar).await {
         tracing::warn!(id, error = %e, "sidecar write failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bookshelf_core::domain::BookFile;
+
+    const PROBE: &str = "reconcile-test";
+    /// repair_one writes with the provider's real SOURCE_KEY (hardcoded);
+    /// this probe book id is only ever touched here, in the scratch DB.
+    const PROBE_BOOK: i64 = 91342;
+
+    struct NullSink;
+
+    #[async_trait::async_trait]
+    impl EventSink for NullSink {
+        async fn emit(&self, _: &str, _: EventKind, _: Option<i64>, _: Json) {}
+    }
+
+    fn probe_file(book_id: i64, path: Option<String>) -> BookFile {
+        BookFile {
+            source: SOURCE_KEY.into(),
+            book_id,
+            format: "txt".into(),
+            url: None,
+            bytes_expected: None,
+            remote_modified: None,
+            path,
+            status: "pending".into(),
+            attempts: 0,
+            retry_at: None,
+            last_error: None,
+        }
+    }
+
+    fn test_cfg(library_dir: std::path::PathBuf) -> Config {
+        Config {
+            database_url: String::new(),
+            library_dir,
+            rsync_host: "localhost".into(),
+            rsync_module: "test".into(),
+            download_host: "http://127.0.0.1:9".into(),
+            formats: vec![rdf::Format::Txt],
+            max_parallel_downloads: 1,
+            request_interval_ms: 10,
+            timeout_secs: 2,
+            max_total_attempts: 3,
+            circuit_breaker: 3,
+            full_sync_interval_days: 7,
+            feed_check_days: 1,
+            backfill_on_start: false,
+            contact_email: String::new(),
+            triage: TriageMode::Rules,
+            agent_provider: String::new(),
+            agent_model: String::new(),
+            otlp_endpoint: None,
+        }
+    }
+
+    /// Scratch dir under the OS temp dir; callers remove it when done.
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("bookshelf-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    async fn test_store() -> Option<Arc<StorePostgres>> {
+        let url = std::env::var("BOOKSHELF_DATABASE_URL").ok()?;
+        let store = StorePostgres::connect(&url).await.ok()?;
+        store.migrate().await.ok()?;
+        Some(Arc::new(store))
+    }
+
+    // -- reconcile_ids (pure) ---------------------------------------------
+
+    #[test]
+    fn reconcile_ids_empty_when_mirror_fully_ingested() {
+        let mirror = vec![1, 2, 3];
+        assert!(reconcile_ids(&mirror, &mirror, &[]).is_empty());
+    }
+
+    #[test]
+    fn reconcile_ids_excludes_planned_overlap() {
+        // requested ∪ itemized already covers 2 and 3; only 4 is new
+        assert_eq!(reconcile_ids(&[4, 2, 3], &[2], &[3]), vec![4]);
+    }
+
+    #[test]
+    fn reconcile_ids_backfills_fresh_mirror() {
+        // first backfill: empty DB, no planned ids → the whole mirror
+        let mirror: Vec<i64> = (7..=5006).collect();
+        let out = reconcile_ids(&mirror, &[], &[]);
+        assert_eq!(out.len(), 5000);
+        assert!(out.windows(2).all(|w| w[0] < w[1]), "sorted");
+    }
+
+    #[test]
+    fn reconcile_ids_tolerates_unsorted_and_duplicate_inputs() {
+        // interrupted-run leftovers arrive in any order; mirror dups dedup
+        assert_eq!(reconcile_ids(&[9, 3, 9, 7], &[3], &[7]), vec![9]);
+    }
+
+    // -- stat-before-download decision (pure fs) ---------------------------
+
+    #[tokio::test]
+    async fn stat_mirror_file_present_only_for_non_empty_files() {
+        let tmp = tmp_dir("stat");
+        let dir = tmp.join("mirror/1342");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let on_disk = dir.join("pg1342.txt");
+        let file = probe_file(1342, Some("mirror/1342/pg1342.txt".into()));
+
+        // missing → None
+        assert!(stat_mirror_file(&tmp, &file).await.is_none());
+        // zero bytes → None (a truncated copy is not a delivered file)
+        tokio::fs::write(&on_disk, b"").await.unwrap();
+        assert!(stat_mirror_file(&tmp, &file).await.is_none());
+        // non-empty → Some with the rel path and its size
+        tokio::fs::write(&on_disk, b"body").await.unwrap();
+        let (rel, len) = stat_mirror_file(&tmp, &file).await.expect("present");
+        assert_eq!(rel, "mirror/1342/pg1342.txt");
+        assert_eq!(len, 4);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn stat_mirror_file_derives_path_from_mirror_layout() {
+        let tmp = tmp_dir("stat-fallback");
+        let dir = tmp.join("mirror/1342");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("pg1342.txt"), b"x")
+            .await
+            .unwrap();
+        let file = probe_file(1342, None); // row lost its path → derive pg{id}.txt
+
+        let (rel, _) = stat_mirror_file(&tmp, &file).await.expect("derived");
+        assert_eq!(rel, "mirror/1342/pg1342.txt");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // -- DB-gated: the cycle's self-heal path -------------------------------
+
+    async fn cleanup_probe_books(store: &StorePostgres) {
+        let _ = sqlx::query("DELETE FROM books WHERE source = $1")
+            .bind(PROBE)
+            .execute(store.pool())
+            .await;
+    }
+
+    async fn cleanup_probe_book_files(store: &StorePostgres) {
+        let _ = sqlx::query("DELETE FROM book_files WHERE source = $1 AND book_id = $2")
+            .bind(SOURCE_KEY)
+            .bind(PROBE_BOOK)
+            .execute(store.pool())
+            .await;
+        let _ = sqlx::query("DELETE FROM books WHERE source = $1 AND id = $2")
+            .bind(SOURCE_KEY)
+            .bind(PROBE_BOOK)
+            .execute(store.pool())
+            .await;
+    }
+
+    /// Mirror rdf the DB lacks → reconcile yields it; once the book row
+    /// exists (ingest ran), the diff is empty. Fixture-backed, scratch DB.
+    #[tokio::test]
+    async fn reconcile_ingests_mirror_ids_missing_from_db() {
+        let Some(store) = test_store().await else {
+            eprintln!("SKIP: BOOKSHELF_DATABASE_URL not set");
+            return;
+        };
+        let tmp = tmp_dir("reconcile");
+        let mirror = tmp.join("mirror");
+        tokio::fs::create_dir_all(mirror.join("1342"))
+            .await
+            .unwrap();
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/pg1342.rdf");
+        tokio::fs::copy(fixture, mirror.join("1342/pg1342.rdf"))
+            .await
+            .unwrap();
+        cleanup_probe_books(&store).await;
+
+        let on_disk = scan_mirror_rdfs(&mirror).await;
+        assert_eq!(on_disk, vec![1342]);
+        let in_db = store.book_ids(PROBE).await.unwrap();
+        assert!(in_db.is_empty(), "probe source starts clean");
+        assert_eq!(reconcile_ids(&on_disk, &in_db, &[]), vec![1342]);
+
+        sqlx::query(
+            "INSERT INTO books (source, id, title, status, first_seen, updated_at) \
+             VALUES ($1, 1342, 'probe', 'discovered', now(), now())",
+        )
+        .bind(PROBE)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let in_db = store.book_ids(PROBE).await.unwrap();
+        assert_eq!(in_db, vec![1342]);
+        assert!(
+            reconcile_ids(&on_disk, &in_db, &[]).is_empty(),
+            "no diff once the book row exists"
+        );
+        // ids already planned (requested ∪ itemized) never reconcile twice
+        assert!(reconcile_ids(&on_disk, &[], &[1342]).is_empty());
+
+        cleanup_probe_books(&store).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// repair_one must stat before it fetches: with the file already on
+    /// disk the row flips to done and no download is attempted — the url
+    /// points at a refuse-instantly port, so any fetch would run the fail
+    /// ladder and the row would NOT be done.
+    #[tokio::test]
+    async fn repair_marks_on_disk_file_done_without_download() {
+        let Some(store) = test_store().await else {
+            eprintln!("SKIP: BOOKSHELF_DATABASE_URL not set");
+            return;
+        };
+        let tmp = tmp_dir("repair-stat");
+        let dir = tmp.join("mirror/91342");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("pg91342.txt"), b"on-disk copy")
+            .await
+            .unwrap();
+        cleanup_probe_book_files(&store).await;
+        // book_files carries an FK to books — the probe book row first
+        sqlx::query(
+            "INSERT INTO books (source, id, title, status, first_seen, updated_at) \
+             VALUES ($1, $2, 'probe', 'discovered', now(), now())",
+        )
+        .bind(SOURCE_KEY)
+        .bind(PROBE_BOOK)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO book_files (source, book_id, format, url, path, status) \
+             VALUES ($1, $2, 'txt', 'http://127.0.0.1:9/pg91342.txt', \
+                     'mirror/91342/pg91342.txt', 'pending')",
+        )
+        .bind(SOURCE_KEY)
+        .bind(PROBE_BOOK)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let cfg = Arc::new(test_cfg(tmp.clone()));
+        let http = Arc::new(
+            PoliteClient::new(
+                &cfg.user_agent(),
+                Duration::from_secs(2),
+                Duration::from_millis(10),
+                1,
+            )
+            .unwrap(),
+        );
+        let events: Arc<dyn EventSink> = Arc::new(NullSink);
+        let counters = Arc::new(parking_lot::Mutex::new(RepairCounters::default()));
+        let file = store
+            .get_files(SOURCE_KEY, PROBE_BOOK)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("probe file row");
+
+        repair_one(&file, &store, &events, &http, &cfg, None, &counters).await;
+
+        let rows = store.get_files(SOURCE_KEY, PROBE_BOOK).await.unwrap();
+        assert_eq!(rows[0].status, "done", "on-disk copy must be marked done");
+        assert_eq!(rows[0].path.as_deref(), Some("mirror/91342/pg91342.txt"));
+        assert_eq!(counters.lock().repaired, 1);
+
+        cleanup_probe_book_files(&store).await;
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

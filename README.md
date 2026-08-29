@@ -17,6 +17,10 @@ PostgreSQL plus an append-only JSONL event log. First provider:
 - **RDF ingest** from the local mirror fills `books`, `book_files`,
   `categories`, `book_categories`; categories come bottom-up from
   `pgterms:bookshelf` values, parents from a hardcoded seed snapshot.
+  Every cycle also reconciles the mirror against the DB before ingesting
+  (`reconcile=N` in the log), so files delivered by an interrupted run
+  are picked up on the next run instead of being lost to rsync's
+  mtime-delta.
 - **HTTP repair** (gap-fill only) through a rate-limited client
   (1 request / `request_interval_ms`, ≤ `max_parallel_downloads` parallel),
   driven by deterministic triage rules; an optional LLM agent

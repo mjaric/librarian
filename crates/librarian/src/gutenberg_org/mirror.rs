@@ -1,7 +1,7 @@
 //! The gutenberg-epub mirror transport: builds rsync invocations on the
 //! shared [`RsyncRunner`], maps `%i|%n|%b` lines to `(book_id, format)`,
 //! applies the rsync retry ladder (+5 min / +10 min / +1 h) and the
-//! connection-level fallback host (`rsync.ibiblio.org`).
+//! connection-level host pair (primary + alternate, see [`host_pair`]).
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -9,9 +9,27 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::rdf::{Format, MirrorEntry, parse_mirror_name};
-use bookshelf_core::{ExitClass, InterruptFlag, RsyncRunner, parse_itemize};
+use bookshelf_core::{ExitClass, InterruptFlag, RsyncProgress, RsyncRunner, parse_itemize};
 
+/// Classic fallback rsync host.
 pub const FALLBACK_HOST: &str = "rsync.ibiblio.org";
+/// Alternate host used when the primary already is [`FALLBACK_HOST`], so
+/// the retry ladder always has two distinct hosts to rotate through.
+pub const ALT_HOST: &str = "gutenberg.pglaf.org";
+
+/// `(primary, alternate)` hosts for the retry ladder and listing loops.
+/// Pure and total: the two returned hosts are never equal. When the
+/// configured primary already is the classic fallback
+/// (`rsync.ibiblio.org`, the A/B winner), the alternate is [`ALT_HOST`];
+/// any other primary alternates with [`FALLBACK_HOST`].
+fn host_pair(primary_host: &str) -> (&str, &'static str) {
+    let alternate = if primary_host == FALLBACK_HOST {
+        ALT_HOST
+    } else {
+        FALLBACK_HOST
+    };
+    (primary_host, alternate)
+}
 
 #[derive(Debug, Clone)]
 pub struct MirrorTransfer {
@@ -178,8 +196,9 @@ impl Mirror {
     /// Weekly/first full pull over the whole module with `--delete`.
     pub async fn full_pull(&self) -> PullResult {
         self.begin_pull();
-        let primary = self.full_args(&self.primary_host);
-        let fallback = self.full_args(FALLBACK_HOST);
+        let (primary_host, alternate_host) = host_pair(&self.primary_host);
+        let primary = self.full_args(primary_host);
+        let fallback = self.full_args(alternate_host);
         self.run_ladder(vec![primary.clone(), fallback.clone(), primary, fallback])
             .await
     }
@@ -220,7 +239,8 @@ impl Mirror {
     /// Number of book dirs in the remote module (one listing connection).
     /// Falls back to the second host; 0 when unreachable.
     pub async fn total_books(&self) -> i64 {
-        for host in [self.primary_host.as_str(), FALLBACK_HOST] {
+        let (primary, alternate) = host_pair(&self.primary_host);
+        for host in [primary, alternate] {
             let args = vec![
                 "--list-only".to_string(),
                 format!("{host}::{}/", self.module),
@@ -258,8 +278,9 @@ impl Mirror {
 
     /// One batched `--relative` invocation ladder (no per-id escalation).
     async fn targeted_pull_batch(&self, ids: &[i64]) -> PullResult {
-        let primary = self.targeted_args(&self.primary_host, ids);
-        let fallback = self.targeted_args(FALLBACK_HOST, ids);
+        let (primary_host, alternate_host) = host_pair(&self.primary_host);
+        let primary = self.targeted_args(primary_host, ids);
+        let fallback = self.targeted_args(alternate_host, ids);
         self.run_ladder(vec![primary.clone(), fallback.clone(), primary, fallback])
             .await
     }
@@ -267,7 +288,8 @@ impl Mirror {
     /// First `n` book ids from a module listing (one connection, no file
     /// transfer). Empty on connection failure after host fallback.
     pub async fn list_ids(&self, n: usize) -> Vec<i64> {
-        for host in [self.primary_host.as_str(), FALLBACK_HOST] {
+        let (primary, alternate) = host_pair(&self.primary_host);
+        for host in [primary, alternate] {
             let args = vec![
                 "--list-only".to_string(),
                 format!("{host}::{}/", self.module),
@@ -319,7 +341,8 @@ impl Mirror {
             Duration::from_secs(60 * 60),
         ];
         let mut result = PullResult::default();
-        let hosts = [self.primary_host.as_str(), FALLBACK_HOST];
+        let (primary, alternate) = host_pair(&self.primary_host);
+        let hosts = [primary, alternate];
 
         for (i, args) in attempts.into_iter().enumerate() {
             if i > 0 {
@@ -425,5 +448,29 @@ impl PullResult {
     pub fn ingest_ids(&self) -> Vec<i64> {
         let set: BTreeSet<i64> = self.rdf_ids.iter().copied().collect();
         set.into_iter().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ALT_HOST, FALLBACK_HOST, host_pair};
+
+    #[test]
+    fn primary_fallback_gets_pglaf_alternate() {
+        // The A/B winner as primary must NOT pair with itself four times.
+        assert_eq!(host_pair(FALLBACK_HOST), (FALLBACK_HOST, ALT_HOST));
+    }
+
+    #[test]
+    fn primary_pglaf_gets_fallback_alternate() {
+        assert_eq!(host_pair(ALT_HOST), (ALT_HOST, FALLBACK_HOST));
+    }
+
+    #[test]
+    fn any_other_primary_keeps_fallback_alternate() {
+        assert_eq!(
+            host_pair("mirror.example.org"),
+            ("mirror.example.org", FALLBACK_HOST)
+        );
     }
 }

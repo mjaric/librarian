@@ -3,6 +3,7 @@
 # points at the OTLP/HTTP collector on the host network (telemetry compose
 # project — see the README "Monitoring" section). Bare base URL: the daemon
 # appends the /v1/metrics signal path itself.
+rsync_host = "rsync.ibiblio.org"  # primary: A/B winner vs default gutenberg.pglaf.org (114× faster listing); retries automatically alternate with gutenberg.pglaf.org
 
 library_dir = "/data"
 

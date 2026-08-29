@@ -85,6 +85,9 @@ docker compose logs -f librarian   # wait for "daemon ready"
   queue. Change the credentials for anything beyond a localhost setup.
 - `docker compose stop librarian` sends SIGTERM → graceful shutdown
   (running job requeued, rsync children group-killed), exit 0.
+- rsync source: the container config pins `rsync_host = "rsync.ibiblio.org"`
+  (A/B winner, ~114× faster listing); the daemon automatically alternates
+  with `gutenberg.pglaf.org` on retries, so the ladder never repeats a host.
 - The first daemon start enqueues the full backfill (~230 GB, 1–3 days).
   Set `backfill_on_start = false` to control when that happens and start it
   yourself with `librarian sync`.

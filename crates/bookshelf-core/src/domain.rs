@@ -122,6 +122,37 @@ pub struct Category {
     pub updated_at: OffsetDateTime,
 }
 
+/// Catalog read row (web UI lists): the card/spine/search projection of a
+/// book. Mapped onto `bookshelf_api::BookHit` by the server.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct BookHitRow {
+    pub id: i64,
+    pub title: String,
+    pub authors: Json,
+    pub issued: Option<time::Date>,
+    pub language: String,
+    pub downloads: Option<i32>,
+    pub has_cover: bool,
+    pub categories: Vec<String>,
+    pub txt_bytes: Option<i64>,
+}
+
+/// Which fields a catalog search looks at (web UI scope selector).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogScope {
+    All,
+    Title,
+    Author,
+}
+
+/// One leaf with its parent group and book count (category tree read).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct CategoryCountRow {
+    pub parent: Option<String>,
+    pub leaf: String,
+    pub books: i64,
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct SyncRun {
     pub id: i64,

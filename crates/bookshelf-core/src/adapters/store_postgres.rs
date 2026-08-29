@@ -6,7 +6,9 @@ use anyhow::Context;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use time::OffsetDateTime;
 
-use crate::domain::{Book, BookFile, Category, SyncRun};
+use crate::domain::{
+    Book, BookFile, BookHitRow, CatalogScope, Category, CategoryCountRow, SyncRun,
+};
 
 pub struct StorePostgres {
     pool: PgPool,
@@ -522,6 +524,145 @@ impl StorePostgres {
                 .fetch_one(&self.pool)
                 .await?,
         )
+    }
+
+    // -- catalog reads (web UI) ---------------------------------------------
+    //
+    // Read-only projections for the web front end. `strpos(lower(..))` beats
+    // ILIKE here: no wildcard escaping, and these tables are seq-scanned
+    // either way at mirror scale (single-user local catalog).
+
+    /// (books, categories, synced) totals.
+    pub async fn catalog_stats(&self, source: &str) -> anyhow::Result<(i64, i64, i64)> {
+        let stats = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM books WHERE source = $1), \
+                    (SELECT count(*) FROM categories WHERE source = $1), \
+                    (SELECT count(*) FROM books WHERE source = $1 AND status = 'synced')",
+        )
+        .bind(source)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(stats)
+    }
+
+    /// Every leaf with its parent group and book count.
+    pub async fn category_counts(&self, source: &str) -> anyhow::Result<Vec<CategoryCountRow>> {
+        let rows = sqlx::query_as::<_, CategoryCountRow>(
+            "SELECT c.parent, c.name AS leaf, \
+                    (SELECT count(*) FROM book_categories bc \
+                      WHERE bc.source = c.source AND bc.category = c.name) AS books \
+             FROM categories c WHERE c.source = $1 \
+             ORDER BY c.parent NULLS LAST, books DESC, c.name",
+        )
+        .bind(source)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// The card/spine projection shared by every catalog list query.
+    const HIT_COLUMNS: &'static str = "b.id, b.title, b.authors, b.issued, b.language, b.downloads, \
+        EXISTS(SELECT 1 FROM book_files f WHERE f.source = b.source AND f.book_id = b.id \
+               AND f.format = 'cover' AND f.status = 'done') AS has_cover, \
+        COALESCE((SELECT array_agg(bc.category ORDER BY bc.category) FROM book_categories bc \
+                  WHERE bc.source = b.source AND bc.book_id = b.id), '{}') AS categories, \
+        (SELECT f.bytes_expected FROM book_files f WHERE f.source = b.source AND f.book_id = b.id \
+               AND f.format = 'txt' AND f.status = 'done' LIMIT 1) AS txt_bytes";
+
+    /// Books shelved under one leaf, optionally text-filtered, paged by
+    /// downloads. Returns (hits, total matching).
+    pub async fn books_in_category(
+        &self,
+        source: &str,
+        category: &str,
+        q: &str,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<(Vec<BookHitRow>, i64)> {
+        let hits = sqlx::query_as::<_, BookHitRow>(sqlx::AssertSqlSafe(format!(
+            "SELECT {} FROM books b \
+             JOIN book_categories bc ON bc.source = b.source AND bc.book_id = b.id \
+             WHERE b.source = $1 AND bc.category = $2 \
+             AND ($3::text = '' OR strpos(lower(b.title), lower($3)) > 0 \
+                  OR strpos(lower(b.authors::text), lower($3)) > 0) \
+             ORDER BY b.downloads DESC NULLS LAST, b.id \
+             LIMIT $4 OFFSET $5",
+            Self::HIT_COLUMNS
+        )))
+        .bind(source)
+        .bind(category)
+        .bind(q)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+        let total: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM books b \
+             JOIN book_categories bc ON bc.source = b.source AND bc.book_id = b.id \
+             WHERE b.source = $1 AND bc.category = $2 \
+             AND ($3::text = '' OR strpos(lower(b.title), lower($3)) > 0 \
+                  OR strpos(lower(b.authors::text), lower($3)) > 0)",
+        )
+        .bind(source)
+        .bind(category)
+        .bind(q)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((hits, total))
+    }
+
+    /// Catalog search over title and/or author names, best-downloaded first.
+    pub async fn search_books(
+        &self,
+        source: &str,
+        q: &str,
+        scope: CatalogScope,
+        limit: i64,
+    ) -> anyhow::Result<Vec<BookHitRow>> {
+        let cond = match scope {
+            CatalogScope::All => {
+                "strpos(lower(b.title), lower($2)) > 0 OR strpos(lower(b.authors::text), lower($2)) > 0"
+            }
+            CatalogScope::Title => "strpos(lower(b.title), lower($2)) > 0",
+            CatalogScope::Author => "strpos(lower(b.authors::text), lower($2)) > 0",
+        };
+        let hits = sqlx::query_as::<_, BookHitRow>(sqlx::AssertSqlSafe(format!(
+            "SELECT {} FROM books b WHERE b.source = $1 AND ({cond}) \
+             ORDER BY b.downloads DESC NULLS LAST, b.id LIMIT $3",
+            Self::HIT_COLUMNS
+        )))
+        .bind(source)
+        .bind(q)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(hits)
+    }
+
+    /// Most recently updated books (fresh on the shelf).
+    pub async fn recent_books(&self, source: &str, limit: i64) -> anyhow::Result<Vec<BookHitRow>> {
+        let hits = sqlx::query_as::<_, BookHitRow>(sqlx::AssertSqlSafe(format!(
+            "SELECT {} FROM books b WHERE b.source = $1 \
+             ORDER BY b.updated_at DESC, b.id DESC LIMIT $2",
+            Self::HIT_COLUMNS
+        )))
+        .bind(source)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(hits)
+    }
+
+    /// One random hit ("surprise me").
+    pub async fn random_book(&self, source: &str) -> anyhow::Result<Option<BookHitRow>> {
+        let hit = sqlx::query_as::<_, BookHitRow>(sqlx::AssertSqlSafe(format!(
+            "SELECT {} FROM books b WHERE b.source = $1 ORDER BY random() LIMIT 1",
+            Self::HIT_COLUMNS
+        )))
+        .bind(source)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(hit)
     }
 
     // -- jobs (queue helpers used by tests and ops) ---------------------------

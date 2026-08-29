@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>librarian — private catalogue</title>
+  <meta name="color-scheme" content="light">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='4' y='6' width='6' height='22' rx='1' fill='%23722F26'/%3E%3Crect x='13' y='10' width='6' height='18' rx='1' fill='%23A0712F'/%3E%3Crect x='22' y='4' width='6' height='24' rx='1' fill='%2346695D'/%3E%3C/svg%3E">
+  <link rel="preload" href="/fonts/EBGaramond.ttf" as="font" type="font/ttf" crossorigin>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module">
+    import init from '/pkg/bookshelf_ui.js';
+    init('/pkg/bookshelf_ui_bg.wasm').then((m) => m.main()).catch((e) => {
+      const el = document.getElementById('app');
+      if (el) {
+        el.innerHTML = '<p class="boot-error">The catalogue failed to start: ' + e +
+          '<br>Rebuild the UI bundle with <code>cargo run -p xtask -- dist</code>.</p>';
+      }
+    });
+  </script>
+</head>
+<body>
+  <div id="app">
+    <p class="boot-wait">Opening the catalogue…</p>
+  </div>
+</body>
+</html>

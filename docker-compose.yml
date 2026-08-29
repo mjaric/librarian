@@ -35,6 +35,24 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+  librarian-web:
+    build:
+      context: .
+      dockerfile: docker/web.Dockerfile
+    user: "1000:1000"
+    init: true
+    environment:
+      BOOKSHELF_DATABASE_URL: postgres://bookshelf:bookshelf@postgres:5432/bookshelf
+      RUST_LOG: info
+    volumes:
+      # Same mirror as the daemon, read-only: the web shell never writes.
+      - ${HOME}/.bookshelf:/data:ro
+    ports:
+      # 127.0.0.1 by default (repo posture). Widen to "8787:8787" for LAN.
+      - "127.0.0.1:8787:8787"
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:

@@ -1,0 +1,24 @@
+[package]
+name = "librarian-web"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bookshelf-core = { path = "../bookshelf-core", default-features = false }
+bookshelf-api = { path = "../bookshelf-api" }
+tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "signal", "fs", "io-util"] }
+tokio-util = { version = "=0.7.19", features = ["io"] }
+axum = "=0.8.9"
+tower-http = { version = "=0.7.0", features = ["fs"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+toml = "=1.1.4"
+clap = { version = "=4.6.6", features = ["derive"] }
+anyhow = "=1.0.104"
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
+time = { version = "=0.3.55", features = ["formatting"] }
+
+[[bin]]
+name = "librarian-web"
+path = "src/main.rs"

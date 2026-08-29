@@ -1,0 +1,9 @@
+# Container-side librarian-web config. The mirror is the same bind mount
+# the daemon writes (mounted read-only here — the web shell never writes).
+# BOOKSHELF_DATABASE_URL (env) always wins over the file.
+
+library_dir = "/data"
+# 0.0.0.0 inside the container so the published port works; compose maps
+# it to 127.0.0.1:8787 on the host by default (widen there for LAN access).
+bind       = "0.0.0.0:8787"
+static_dir = "/app/static"

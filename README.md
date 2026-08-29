@@ -1,9 +1,11 @@
 # bookshelf
 
-Provider-based archive synchronizer. The backend binary `librarian` keeps a
-local mirror of the [Project Gutenberg](https://www.gutenberg.org) archive —
-politely, via their sanctioned rsync service — and records book state in
-PostgreSQL plus an append-only JSONL event log. First provider:
+Provider-based archive synchronizer with a web catalogue. The backend binary
+`librarian` keeps a local mirror of the
+[Project Gutenberg](https://www.gutenberg.org) archive — politely, via their
+sanctioned rsync service — and records book state in PostgreSQL plus an
+append-only JSONL event log. `librarian-web` serves the mirror as a Leptos
+web UI (search, category shelves, book pages with downloads). First provider:
 `gutenberg_org` (source key `project-gutenberg`).
 
 ## How it works
@@ -34,20 +36,30 @@ PostgreSQL plus an append-only JSONL event log. First provider:
   rsync children run in their own process groups with `PR_SET_PDEATHSIG`,
   so no ghost process can outlive the daemon.
 
-## Workspace layout
-
 ```
 crates/bookshelf-core/   shared infra: domain + ports (EventSink, Triage),
                           Postgres store + migrations, JSONL event log,
                           PoliteClient, RsyncRunner, triage rules/agent
-crates/librarian/        the binary: CLI + daemon, config, provider trait
-                          + registry, job queue, gutenberg_org provider
+crates/librarian/        the backend binary: CLI + daemon, config, provider
+                          trait + registry, job queue, gutenberg_org provider
                           (mirror / rdf / feed / taxonomy)
+crates/bookshelf-api/    wire DTOs shared by every frontend shell and the
+                          servers feeding them (serde only, wasm-safe)
+crates/bookshelf-ui/     the Leptos catalogue front end (CSR wasm bundle);
+                          shell-agnostic by design — web today, desktop later
+crates/librarian-web/    the web shell binary: axum JSON API + static UI +
+                          cover/file streaming from the local mirror
+crates/xtask/            cargo-native build orchestration (`dist`)
 ```
 
 Hexagonal-lite: core owns source-agnostic adapters; everything
 Gutenberg-specific lives behind the `gutenberg_org` module. A second source
 later = a new module + one registry entry.
+
+The UI split is deliberate: `bookshelf-ui` knows only the JSON API contract
+(`bookshelf-api`), never the DB, so the same wasm bundle can later ship in a
+desktop shell (e.g. a webview wrapper around `librarian-web`'s API) without
+changes.
 
 ## Setup
 
@@ -306,6 +318,87 @@ Prometheus scrapes `:8889` every 5 s, and Grafana renders the provisioned
 progress + rate, the 120 s rsync-silence stall detector, the 90 s heartbeat
 threshold, queue/books/files by status, and cycle rate/duration.
 
+## Web UI
+
+`librarian-web` is a read-only shell: JSON API under `/api`, the Leptos
+bundle + assets from its `static/` dir, covers and book files streamed from
+the local mirror. It never writes, so it runs happily beside the daemon
+against the same Postgres.
+
+One-time toolchain for the UI bundle:
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.127   # must match the crate pin
+```
+
+Build and serve:
+
+```sh
+cargo run -p xtask -- dist        # wasm UI → crates/librarian-web/static/pkg/
+cargo run -p librarian-web -- --config librarian-smoke.toml
+# → http://127.0.0.1:8787  (Home / Categories / a book page per hit)
+```
+
+Config: same file search order as the daemon (`--config` →
+`$BOOKSHELF_CONFIG` → `./librarian.toml`); `BOOKSHELF_DATABASE_URL` still
+wins. It reads `database_url`, `library_dir` and adds:
+
+```toml
+bind       = "127.0.0.1:8787"  # listen address
+static_dir = "./static"        # UI bundle location
+```
+
+Unknown keys are ignored, so one `librarian.toml` can drive both binaries.
+API surface: `/api/stats`, `/api/search?q&scope`, `/api/recent`,
+`/api/categories`, `/api/categories/{leaf}/books?q&limit`,
+`/api/books/{id}`, `/api/books/random`,
+`/api/books/{id}/files/{format}[?disposition=inline]`, `/api/covers/{id}`.
+
+### Deployment
+
+**Docker (recommended).** The compose stack now carries the web shell next
+to the daemon — same Postgres, same mirror bind-mounted **read-only**:
+
+```sh
+docker compose up -d --build       # postgres + librarian + librarian-web
+# catalogue: http://127.0.0.1:8787
+```
+
+The web image (`docker/web.Dockerfile`) builds both the server binary and
+the wasm UI bundle in one multi-stage build — no host toolchain needed.
+Inside the container it listens on `0.0.0.0:8787` (`docker/librarian-web.toml`);
+compose publishes it on `127.0.0.1` only, matching the Postgres posture.
+For LAN access change the port mapping to `"8787:8787"` — and remember
+there is **no authentication**: anything that reaches the port can browse
+and download the whole mirror, so put a reverse proxy with auth in front
+for anything beyond a trusted home network.
+
+**Bare metal.** Build and run from the repo (assets resolve automatically):
+
+```sh
+cargo build --release --locked -p librarian-web
+cargo run -p xtask -- dist
+./target/release/librarian-web --config librarian-smoke.toml
+```
+
+For an installed binary (`cargo install --path crates/librarian-web`), ship
+`crates/librarian-web/static/` next to it and point `static_dir` at it.
+Widen the audience with `bind = "0.0.0.0:8787"` (or a specific interface's
+IP) — same no-auth caveat as above. `SIGTERM` drains in-flight responses
+and exits cleanly.
+
+systemd:
+
+```ini
+[Service]
+ExecStart=/usr/local/bin/librarian-web --config /etc/librarian/librarian-web.toml
+Environment=BOOKSHELF_DATABASE_URL=postgres://...
+Restart=on-failure
+KillSignal=SIGTERM
+```
+
+
 ## State
 
 - **Postgres**: `books`, `book_files`, `categories`, `book_categories`,
@@ -323,6 +416,8 @@ BOOKSHELF_DATABASE_URL=... cargo test   # + queue/store/monitoring DB tests
 cargo run -p librarian -- status         # daemon + active cycle + queue + provider report
 cargo run -p librarian -- runs           # recent sync_runs rows
 cargo run -p librarian -- jobs           # recent queue rows
+cargo run -p xtask -- dist               # build the web UI bundle
+cargo run -p librarian-web -- --config librarian-smoke.toml  # serve + browse
 ```
 
 The RDF parser is fixture-tested against a verbatim `pg1342.rdf`; triage,

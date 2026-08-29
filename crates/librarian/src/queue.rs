@@ -178,6 +178,18 @@ impl JobQueue {
         .fetch_one(&self.pool)
         .await?)
     }
+
+    /// Recent jobs for one source, newest first — the CLI `jobs` view.
+    pub async fn recent(&self, source: &str, limit: i64) -> anyhow::Result<Vec<JobRow>> {
+        let jobs = bookshelf_core::sqlx::query_as::<_, JobRow>(
+            "SELECT * FROM jobs WHERE source = $1 ORDER BY id DESC LIMIT $2",
+        )
+        .bind(source)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(jobs)
+    }
 }
 
 /// Listener convenience for the daemon worker loop.

@@ -170,7 +170,10 @@ First pull typically takes 1–3 days; weekly pulls are delta-only.
 librarian daemon                       # the backend: embedded scheduler + worker
 librarian sync [--feed] [--limit N] [--only ID]... [--no-ingest] [--wait]
 librarian repair [--only ID]... [--wait]
-librarian status
+librarian status                       # daemon + active cycle + queue + provider report
+librarian watch [--interval S]         # live dashboard (2 s default, Ctrl-C exits)
+librarian runs [--limit N]             # recent sync_runs rows, newest first
+librarian jobs [--limit N]             # recent queue jobs, newest first
 librarian progress [--provider KEY]    # downloaded / total + % per source
 librarian retry-failed
 librarian migrate
@@ -194,6 +197,108 @@ TimeoutStopSec=30
 SIGTERM/SIGINT stop job pickup, group-kill the active rsync, requeue the
 interrupted job (≥3 interruptions → failed) and exit 0.
 
+## Monitoring
+
+`status`, `watch`, `runs` and `jobs` read the daemon's DB state directly —
+cheap queries only, no provider work. Only `status` walks the local mirror,
+once, because it is a one-off command; `watch` deliberately skips the walk
+so it can refresh every couple of seconds (default 2, minimum 1; Ctrl-C
+exits — read-only, nothing to clean up).
+
+```sh
+librarian status              # DAEMON + ACTIVE CYCLE + QUEUE + provider report
+librarian watch               # the cheap views, refreshed live
+librarian runs --limit 20     # sync_runs rows, newest first
+librarian jobs  --limit 20    # jobs rows, newest first
+```
+
+`status` output (sketch):
+
+```
+DAEMON
+  heartbeat: alive (3s ago)
+  next full sync: 2026-09-05 11:33:31
+  last feed check: 2026-08-29 03:00:02
+  rsync host: gutenberg.pglaf.org
+
+ACTIVE CYCLE
+  full_cycle — job 42 run 7 — phase transferring, elapsed 5m 12s
+  files: 1234, bytes: 9.42 MiB (31.0 KiB/s)
+  host: gutenberg.pglaf.org
+  last item: 5s ago
+  ⚠ no items for 3m (trickle/stall?)
+
+QUEUE
+  queued: 0, running: 1
+
+provider: project-gutenberg
+  books discovered: 55000
+  ...
+```
+
+- **heartbeat** — the `daemon_heartbeat` meta key is a *process-alive*
+  signal: the worker loop rewrites it every 5 s while idle, and the
+  scheduler tick keeps it warm every 30 s while a long cycle blocks the
+  worker. Under 90 s old → `alive`; older → `STALE`, i.e. the daemon
+  process is probably gone and queued jobs will not move.
+- **active_run** — while a cycle runs, the daemon publishes a JSON snapshot
+  under the `active_run` meta key every 5 s and clears it on every exit
+  path (clean end, interrupt, and the startup crash-guard against ghost
+  runs). Phases: `listing` (remote module walk) → `transferring` (rsync
+  itemize lines) → `ingesting` (RDF) / `repairing` (HTTP gap-fill). The
+  transfer rate shows only while `transferring`.
+- **stall hints** — rsync can sit minutes without a new itemize line while
+  trickling one huge file, and the first listing is the *remote's* walk,
+  not ours; both look like a hang from the outside, so the CLI says so:
+  `⚠ no items for Xm (trickle/stall?)` when `transferring` has seen no new
+  item for over 120 s, and `⚠ listing still running (server-side walk)`
+  when the listing phase passes 300 s.
+- **self-healing** — each cycle reconciles the local mirror against the
+  DB (`reconcile=N`) before ingesting: interrupted runs heal on the next
+  cycle, and a first backfill shows a large N once. The repair pass
+  stats the disk before HTTP: a file already present in the mirror is
+  marked done without a download (`repair skipped download`).
+
+`runs` and `jobs` render plain aligned tables — in-flight runs show
+`· running` with a live duration, and job errors are flattened and
+truncated to ~60 characters:
+
+```
+RUNS — project-gutenberg, last 20
+id  cycle  started→finished                         duration  files  bytes  new  enriched  aborted
+3  full   2026-08-29 11:46:36→2026-08-29 11:51:36  5m 0s         0    0 B    0         0  interrupted
+1  full   2026-08-29 11:33:31→· running            32m 55s       ·      ·    ·         ·  ·
+```
+
+### Observability stack (metrics + dashboards)
+
+The daemon's OTLP metrics land in a self-hosted observability stack living in
+a **separate compose project** at `~/prj/telemetry` (up/down independently
+from bookshelf's own `docker-compose.yml` — the librarian container config
+`docker/librarian.toml` already points at it):
+
+```sh
+docker compose -f ~/prj/telemetry/compose.yml up -d      # start the stack
+docker compose -f ~/prj/telemetry/compose.yml down       # stop it again
+```
+
+Local endpoints (all host-network):
+
+| Surface                     | URL                            |
+| --------------------------- | ------------------------------ |
+| Grafana (Librarian dashboard, admin/admin) | http://127.0.0.1:3001 |
+| Prometheus (query UI/API)   | http://127.0.0.1:9090          |
+| Jaeger UI (traces)          | http://127.0.0.1:16686         |
+| OTLP collector (HTTP)       | http://127.0.0.1:4318 (`/v1/metrics`, `/v1/traces`) |
+
+Chain: the librarian pushes OTLP/HTTP to the collector on `:4318`; the
+collector exposes them on its Prometheus exporter `:8889` (metric names are
+sanitized: `librarian.books` → `librarian_books`, counters gain `_total`),
+Prometheus scrapes `:8889` every 5 s, and Grafana renders the provisioned
+**Librarian — Bookshelf Backfill** dashboard (tag `librarian`): rsync
+progress + rate, the 120 s rsync-silence stall detector, the 90 s heartbeat
+threshold, queue/books/files by status, and cycle rate/duration.
+
 ## State
 
 - **Postgres**: `books`, `book_files`, `categories`, `book_categories`,
@@ -205,11 +310,12 @@ interrupted job (≥3 interruptions → failed) and exit 0.
   categories + file paths), written on the transition to `synced`.
 
 ## Verification
-
 ```sh
 cargo build && cargo test        # unit + fixture tests (no DB needed)
-BOOKSHELF_DATABASE_URL=... cargo test   # + queue/store integration tests
-cargo run -p librarian -- status
+BOOKSHELF_DATABASE_URL=... cargo test   # + queue/store/monitoring DB tests
+cargo run -p librarian -- status         # daemon + active cycle + queue + provider report
+cargo run -p librarian -- runs           # recent sync_runs rows
+cargo run -p librarian -- jobs           # recent queue rows
 ```
 
 The RDF parser is fixture-tested against a verbatim `pg1342.rdf`; triage,

@@ -1,9 +1,11 @@
 //! librarian — the bookshelf backend.
 //!
 //! Data subcommands (`sync`, `repair`) are pure clients: they enqueue a
-//! Postgres job and NOTIFY; only `daemon` executes. `migrate`, `status` and
-//! `retry-failed` are direct, fast DB operations.
+//! Postgres job and NOTIFY; only `daemon` executes. `migrate`, `status`,
+//! `runs` and `jobs` are direct, fast DB reads (plus `watch`, which loops
+//! those reads); `retry-failed` is a direct DB repair.
 
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -14,6 +16,7 @@ use bookshelf_core::{EventLog, InterruptFlag, StorePostgres};
 
 use librarian::config::Config;
 use librarian::gutenberg_org::GutenbergOrg;
+use librarian::monitor;
 use librarian::provider::{CycleOpts, Provider, ensure_known_key, resolve};
 use librarian::queue::JobQueue;
 use librarian::trigger::Trigger;
@@ -95,8 +98,32 @@ enum Cmd {
         #[arg(long, default_value = "project-gutenberg")]
         provider: String,
     },
-    /// Per-status book counts, mirror stats, repair queue state
+    /// Daemon liveness + active cycle + queue, then the provider report
     Status {
+        #[arg(long, default_value = "project-gutenberg")]
+        provider: String,
+    },
+    /// Live-updating dashboard of the cheap DB views (Ctrl-C exits)
+    Watch {
+        /// Seconds between refreshes (≥ 1)
+        #[arg(long, default_value_t = 2)]
+        interval: u64,
+        #[arg(long, default_value = "project-gutenberg")]
+        provider: String,
+    },
+    /// Recent sync_runs rows, newest first (in-flight ones marked running)
+    Runs {
+        /// How many runs to show
+        #[arg(long, default_value_t = 20)]
+        limit: i64,
+        #[arg(long, default_value = "project-gutenberg")]
+        provider: String,
+    },
+    /// Recent queue jobs, newest first
+    Jobs {
+        /// How many jobs to show
+        #[arg(long, default_value_t = 20)]
+        limit: i64,
         #[arg(long, default_value = "project-gutenberg")]
         provider: String,
     },
@@ -222,6 +249,16 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Status { provider } => {
             let store = open_store(&cfg).await?;
+            // cheap DB views first — the provider walk below stays one-off
+            println!("{}", monitor::daemon_section(&store, &provider).await?);
+            println!();
+            println!(
+                "{}",
+                monitor::active_cycle_section(&store, &provider).await?
+            );
+            println!();
+            println!("{}", monitor::queue_section(&store, &provider).await?);
+            println!();
             let events = Arc::new(EventLog::open(&cfg.events_path())?);
             let providers = build_providers(cfg, store, events, InterruptFlag::new())?;
             let p = resolve(&providers, &provider)?;
@@ -252,6 +289,45 @@ async fn main() -> anyhow::Result<()> {
             if let Some(t) = s.next_feed_check {
                 println!("  next feed check: {t}");
             }
+            Ok(())
+        }
+        Cmd::Watch { interval, provider } => {
+            if interval == 0 {
+                anyhow::bail!("--interval must be at least 1 second, got {interval}");
+            }
+            ensure_known_key(&provider)?;
+            let store = open_store(&cfg).await?;
+            loop {
+                print!("\x1b[2J\x1b[H");
+                print!("{}", monitor::watch_frame(&store, &provider, 3).await);
+                let _ = std::io::stdout().flush();
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+            }
+        }
+        Cmd::Runs { limit, provider } => {
+            if limit < 1 {
+                anyhow::bail!("--limit must be at least 1, got {limit}");
+            }
+            ensure_known_key(&provider)?;
+            let store = open_store(&cfg).await?;
+            let runs = store.recent_runs(&provider, limit).await?;
+            println!("RUNS — {provider}, last {limit}");
+            println!(
+                "{}",
+                monitor::runs_table(&runs, time::OffsetDateTime::now_utc())
+            );
+            Ok(())
+        }
+        Cmd::Jobs { limit, provider } => {
+            if limit < 1 {
+                anyhow::bail!("--limit must be at least 1, got {limit}");
+            }
+            ensure_known_key(&provider)?;
+            let store = open_store(&cfg).await?;
+            let queue = JobQueue::new(store.pool().clone());
+            let jobs = queue.recent(&provider, limit).await?;
+            println!("JOBS — {provider}, last {limit}");
+            println!("{}", monitor::jobs_table(&jobs));
             Ok(())
         }
         Cmd::Progress { provider } => {

@@ -80,6 +80,42 @@ impl ProgressReport {
     }
 }
 
+/// Result of the daemon's boot-time [`Provider::adopt`].
+#[derive(Debug)]
+pub struct AdoptReport {
+    /// The bound running job, when one existed.
+    pub job_id: Option<i64>,
+    pub action: AdoptAction,
+}
+
+impl Default for AdoptReport {
+    fn default() -> Self {
+        Self {
+            job_id: None,
+            action: AdoptAction::Nothing,
+        }
+    }
+}
+
+/// What adoption decided about the leftover run artifacts.
+#[derive(Debug)]
+pub enum AdoptAction {
+    /// No artifacts — normal boot.
+    Nothing,
+    /// Resumed/finalized the run through the cycle tail; job done.
+    AdoptedAndCompleted {
+        run_id: i64,
+    },
+    /// Dead-unreaped / intent-only — recovery goes through the
+    /// interrupted-job path (requeue).
+    Requeued,
+    /// Adoption supervised the run but the daemon stopped mid-watch
+    /// (on_daemon_stop = "detach"): the surviving transfer is untouched
+    /// and the job stays `running` for the next daemon to re-adopt.
+    LeftDetached,
+    Failed(String),
+}
+
 #[async_trait]
 pub trait Provider: Send + Sync {
     /// Stable source key, e.g. "project-gutenberg".
@@ -105,6 +141,12 @@ pub trait Provider: Send + Sync {
     /// Attach the daemon's live-observability handle (no-op for providers
     /// that ignore it). Called once by the daemon before any cycle runs.
     fn set_observability(&self, _obs: crate::observability::Observability) {}
+
+    /// Boot-time adoption of detached rsync runs (default: `Nothing` —
+    /// providers without rsync transfers have nothing to adopt).
+    async fn adopt(&self) -> anyhow::Result<AdoptReport> {
+        Ok(AdoptReport::default())
+    }
 }
 
 /// Provider keys compiled into this binary — client-side validation so

@@ -10,4 +10,6 @@ pub mod monitor;
 pub mod observability;
 pub mod provider;
 pub mod queue;
+pub mod supervisor;
+pub mod supervisor_docker;
 pub mod trigger;

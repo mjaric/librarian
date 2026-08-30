@@ -1,15 +1,22 @@
-//! The gutenberg-epub mirror transport: builds rsync invocations on the
-//! shared [`RsyncRunner`], maps `%i|%n|%b` lines to `(book_id, format)`,
-//! applies the rsync retry ladder (+5 min / +10 min / +1 h) and the
-//! connection-level host pair (primary + alternate, see [`host_pair`]).
+//! The gutenberg-epub mirror transport: builds durable rsync specs on the
+//! supervisor ([`RsyncSpec`]) and folds finished detached runs back into
+//! the cycle's [`PullResult`] ([`Mirror::finalize`]). Host rotation is the
+//! connection-level pair (primary + alternate, see [`host_pair`]); the
+//! retry ladder itself lives in `crate::supervisor`. Listings
+//! ([`Mirror::total_books`]/[`Mirror::list_ids`]) keep the blocking
+//! runner with their own host fallback.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
+use super::SOURCE_KEY;
 use super::rdf::{Format, MirrorEntry, parse_mirror_name};
-use bookshelf_core::{ExitClass, InterruptFlag, RsyncProgress, RsyncRunner, parse_itemize};
+use crate::supervisor::RsyncSpec;
+use anyhow::Context;
+use bookshelf_core::{
+    ExitClass, InterruptFlag, RsyncProgress, RsyncRunner, classify_exit, parse_itemize, read_intent,
+};
 
 /// Classic fallback rsync host.
 pub const FALLBACK_HOST: &str = "rsync.ibiblio.org";
@@ -22,13 +29,25 @@ pub const ALT_HOST: &str = "gutenberg.pglaf.org";
 /// configured primary already is the classic fallback
 /// (`rsync.ibiblio.org`, the A/B winner), the alternate is [`ALT_HOST`];
 /// any other primary alternates with [`FALLBACK_HOST`].
-fn host_pair(primary_host: &str) -> (&str, &'static str) {
+pub(crate) fn host_pair(primary_host: &str) -> (&str, &'static str) {
     let alternate = if primary_host == FALLBACK_HOST {
         ALT_HOST
     } else {
         FALLBACK_HOST
     };
     (primary_host, alternate)
+}
+
+/// `<source>-r<run_id>` dir name → run id (the frozen naming convention is
+/// what makes specs self-describing). 0 when unparsable — progress writes
+/// against run 0 affect no row, and nothing else consumes it.
+fn run_id_of(run_dir: &Path) -> i64 {
+    run_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.rsplit_once("-r"))
+        .and_then(|(_, id)| id.parse().ok())
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone)]
@@ -61,9 +80,10 @@ pub struct Mirror {
     dest: PathBuf,
     formats: Vec<Format>,
     interrupt: InterruptFlag,
-    /// Live counters for the current pull (reset per rsync attempt).
+    /// Live counters for the current pull (observability view; the durable
+    /// progress lives in the run dir + sync_runs row under supervision).
     progress: RsyncProgress,
-    /// Host of the most recent rsync attempt (primary or fallback).
+    /// Host of the most recent spec built (primary or fallback).
     host: Arc<parking_lot::Mutex<Option<String>>>,
 }
 
@@ -82,7 +102,7 @@ impl MirrorLive {
     }
 
     /// Cumulative `(files, bytes)` since process start — never reset by
-    /// `begin_pull`; the source for the monotonic rsync counters.
+    /// the transfer paths; the source for the monotonic rsync counters.
     pub fn cumulative_snapshot(&self) -> (u64, u64) {
         self.progress.cumulative_snapshot()
     }
@@ -113,22 +133,6 @@ impl Mirror {
         }
     }
 
-    /// Reset the live counters at pull start so retries never leak old
-    /// numbers into observability.
-    pub fn begin_pull(&self) {
-        self.progress.reset();
-    }
-
-    /// Live `(files, bytes, last_item_unix_ms)`.
-    pub fn progress_snapshot(&self) -> (u64, u64, u64) {
-        self.progress.snapshot()
-    }
-
-    /// Host the most recent attempt ran against (None before the first).
-    pub fn host_snapshot(&self) -> Option<String> {
-        self.host.lock().clone()
-    }
-
     /// Clonable handle for a background publisher task.
     pub fn live(&self) -> MirrorLive {
         MirrorLive {
@@ -156,84 +160,61 @@ impl Mirror {
         args
     }
 
-    fn base_args(&self, relative: bool) -> Vec<String> {
-        let mut args = vec![
-            "-a".to_string(),
-            "--timeout=600".to_string(),
-            "--itemize-changes".to_string(),
-            "--out-format=%i|%n|%b".to_string(),
-        ];
-        if relative {
-            args.push("--relative".to_string());
-        }
-        args.extend(self.include_args());
-        args
+    /// Host for transfer attempt N: odd = primary, even = alternate.
+    fn host_for_attempt(&self, attempt: u32) -> &str {
+        let (primary, alternate) = host_pair(&self.primary_host);
+        if attempt % 2 == 1 { primary } else { alternate }
     }
 
-    fn full_args(&self, host: &str) -> Vec<String> {
-        let mut args = vec![
+    /// Transfer flags shared by every supervised spec. Itemize goes to the
+    /// run dir's log file (stdout is discarded by the detached wrapper),
+    /// and `--partial-dir` keeps interrupted attempts resumable by rsync's
+    /// own delta logic.
+    fn transfer_args(&self, run_dir: &Path) -> Vec<String> {
+        vec![
             "-a".to_string(),
-            "--delete".to_string(),
             "--timeout=600".to_string(),
-            "--itemize-changes".to_string(),
-            "--out-format=%i|%n|%b".to_string(),
-        ];
+            "--partial-dir=.rsync-partial".to_string(),
+            format!("--log-file={}/itemize.log", run_dir.display()),
+            "--log-file-format=%i|%n|%b".to_string(),
+        ]
+    }
+
+    /// Durable args for a FULL pull over the whole module with `--delete`.
+    pub fn full_spec(&self, run_dir: &Path, attempt: u32) -> RsyncSpec {
+        let host = self.host_for_attempt(attempt);
+        let mut args = vec!["--delete".to_string()];
+        args.extend(self.transfer_args(run_dir));
         args.extend(self.include_args());
         args.push(format!("{host}::{}/", self.module));
         args.push(format!("{}/", self.dest.display()));
-        args
+        *self.host.lock() = Some(host.to_string());
+        RsyncSpec {
+            source: SOURCE_KEY.to_string(),
+            run_id: run_id_of(run_dir),
+            args,
+            run_dir: run_dir.to_path_buf(),
+        }
     }
 
-    fn targeted_args(&self, host: &str, ids: &[i64]) -> Vec<String> {
-        let mut args = self.base_args(true);
+    /// Durable args for a TARGETED pull of specific book dirs over one
+    /// connection (`--relative` with `/./` marking the destination cut).
+    pub fn targeted_spec(&self, run_dir: &Path, ids: &[i64], attempt: u32) -> RsyncSpec {
+        let host = self.host_for_attempt(attempt);
+        let mut args = self.transfer_args(run_dir);
+        args.push("--relative".to_string());
+        args.extend(self.include_args());
         for id in ids {
             args.push(format!("{host}::{}/./{id}/", self.module));
         }
         args.push(format!("{}/", self.dest.display()));
-        args
-    }
-
-    /// Weekly/first full pull over the whole module with `--delete`.
-    pub async fn full_pull(&self) -> PullResult {
-        self.begin_pull();
-        let (primary_host, alternate_host) = host_pair(&self.primary_host);
-        let primary = self.full_args(primary_host);
-        let fallback = self.full_args(alternate_host);
-        self.run_ladder(vec![primary.clone(), fallback.clone(), primary, fallback])
-            .await
-    }
-
-    /// Targeted pull of specific book dirs over one connection
-    /// (`--relative` with `/./` marking the destination cut). Falls back to
-    /// one invocation per id when the daemon module mishandles multi-source.
-    pub async fn targeted_pull(&self, ids: &[i64]) -> PullResult {
-        self.begin_pull();
-        let mut result = self.targeted_pull_batch(ids).await;
-        if result.failed && ids.len() > 1 {
-            tracing::warn!("multi-source --relative pull failed; retrying per id");
-            let mut combined = PullResult {
-                host_used: result.host_used.clone(),
-                ..Default::default()
-            };
-            let mut any_ok = false;
-            for id in ids {
-                if self.interrupt.is_set() {
-                    combined.interrupted = true;
-                    break;
-                }
-                let one = self.targeted_pull_batch(&[*id]).await;
-                if one.failed {
-                    continue;
-                }
-                any_ok = true;
-                combined.merge(one);
-            }
-            if any_ok || !combined.transfers.is_empty() {
-                combined.failed = false;
-                result = combined;
-            }
+        *self.host.lock() = Some(host.to_string());
+        RsyncSpec {
+            source: SOURCE_KEY.to_string(),
+            run_id: run_id_of(run_dir),
+            args,
+            run_dir: run_dir.to_path_buf(),
         }
-        result
     }
 
     /// Number of book dirs in the remote module (one listing connection).
@@ -274,15 +255,6 @@ impl Mirror {
             tracing::warn!(host, code = ?outcome.code, "module listing failed");
         }
         0
-    }
-
-    /// One batched `--relative` invocation ladder (no per-id escalation).
-    async fn targeted_pull_batch(&self, ids: &[i64]) -> PullResult {
-        let (primary_host, alternate_host) = host_pair(&self.primary_host);
-        let primary = self.targeted_args(primary_host, ids);
-        let fallback = self.targeted_args(alternate_host, ids);
-        self.run_ladder(vec![primary.clone(), fallback.clone(), primary, fallback])
-            .await
     }
 
     /// First `n` book ids from a module listing (one connection, no file
@@ -329,91 +301,58 @@ impl Mirror {
         Vec::new()
     }
 
-    /// Run the attempt sequence with the ladder delays (+5 min, +10 min,
-    /// +1 h) between retries; Ok/Partial stops the ladder, Fatal aborts
-    /// immediately (the caller marks `rsync_failed` only for retryable
-    /// exhaustion; Fatal outcomes still report `failed`).
-    async fn run_ladder(&self, attempts: Vec<Vec<String>>) -> PullResult {
-        let delays = [
-            Duration::ZERO,
-            Duration::from_secs(5 * 60),
-            Duration::from_secs(10 * 60),
-            Duration::from_secs(60 * 60),
-        ];
-        let mut result = PullResult::default();
-        let (primary, alternate) = host_pair(&self.primary_host);
-        let hosts = [primary, alternate];
-
-        for (i, args) in attempts.into_iter().enumerate() {
-            if i > 0 {
-                tracing::warn!(retry_in = ?delays[i], "rsync retry ladder");
-                tokio::time::sleep(delays[i]).await;
+    /// Fold a finished detached run into the cycle's PullResult: the run
+    /// dir's whole `itemize.log` maps to transfers/removals/rdf ids and
+    /// counters (rsync appends across ladder attempts, so one pass over
+    /// the file is the run's true tally); `host_used` comes from the
+    /// recorded intent; `interrupted` is rsync's aborted-by-signal code.
+    ///
+    /// `failed` reflects only the passed `code` (Fatal). Ladder
+    /// exhaustion is recorded by the CALLER — `supervise` reports it as
+    /// `SuperviseOutcome::Failed`, and the cycle arms the flag there (the
+    /// last retryable exit code alone would read as recoverable).
+    pub fn finalize(&self, run_dir: &Path, code: i32) -> anyhow::Result<PullResult> {
+        let mut result = PullResult {
+            rsync_exit: Some(code),
+            host_used: read_intent(run_dir)?
+                .map(|intent| intent.host)
+                .unwrap_or_default(),
+            interrupted: code == 20,
+            failed: classify_exit(code) == ExitClass::Fatal,
+            ..Default::default()
+        };
+        let raw = match std::fs::read_to_string(run_dir.join("itemize.log")) {
+            Ok(raw) => raw,
+            // Nothing itemized (e.g. nothing to transfer): a valid outcome.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(result),
+            Err(e) => {
+                return Err(e).context(format!("reading itemize log in {}", run_dir.display()));
             }
-            if self.interrupt.is_set() {
-                result.interrupted = true;
-                return result;
-            }
-            result.host_used = hosts[i % 2].to_string();
-            *self.host.lock() = Some(result.host_used.clone());
-            let runner = self.runner.clone();
-            let progress = self.progress.clone();
-            let outcome =
-                tokio::task::spawn_blocking(move || runner.run_blocking(&args, &progress))
-                    .await
-                    .unwrap_or_default();
-            result.rsync_exit = outcome.code.or(result.rsync_exit);
-            if outcome.interrupted {
-                result.interrupted = true;
-                return result;
-            }
-            match outcome.class() {
-                Some(ExitClass::Ok) | Some(ExitClass::Partial) => {
-                    self.absorb(&mut result, &outcome);
-                    if outcome.class() == Some(ExitClass::Partial) {
-                        tracing::warn!(
-                            "rsync partial transfer (files vanished upstream); keeping what arrived"
-                        );
-                    }
-                    return result;
+        };
+        for line in raw.lines() {
+            let Some(item) = parse_itemize(line) else {
+                // `--log-file` also records bookkeeping (`building file
+                // list`, the `sent N bytes` summary) without out-format
+                // shape — expected, not a parse failure.
+                if line.contains('|') {
+                    tracing::warn!(line = %line, "unparseable rsync line");
                 }
-                Some(ExitClass::Fatal) => {
-                    tracing::error!(code = ?outcome.code, stderr = %outcome.stderr, "rsync fatal error — aborting run");
-                    self.absorb(&mut result, &outcome);
-                    result.failed = true;
-                    return result;
-                }
-                _ => {
-                    // Retryable (5/6/10/11) or spawn failure: next attempt.
-                    tracing::warn!(code = ?outcome.code, spawn_error = ?outcome.spawn_error, stderr = %outcome.stderr, "rsync retryable failure");
-                    self.absorb(&mut result, &outcome);
-                }
-            }
-        }
-        result.failed = true;
-        result
-    }
-
-    /// Fold an outcome's itemize lines into the result.
-    fn absorb(&self, result: &mut PullResult, outcome: &bookshelf_core::RsyncOutcome) {
-        for raw in &outcome.stdout {
-            let Some(line) = parse_itemize(raw) else {
-                tracing::warn!(line = %raw, "unparseable rsync line");
                 continue;
             };
-            let Some((book_id, entry)) = parse_mirror_name(&line.name) else {
+            let Some((book_id, entry)) = parse_mirror_name(&item.name) else {
                 // filter leftovers (LICENSE.txt, README.md, …) — harmless
                 continue;
             };
-            if line.is_deletion() {
+            if item.is_deletion() {
                 result.removals.push(MirrorTransfer {
                     book_id,
                     entry,
-                    path: line.name.clone(),
+                    path: item.name.clone(),
                     bytes: 0,
                 });
-            } else if line.is_file_transfer() {
+            } else if item.is_file_transfer() {
                 result.transferred_files += 1;
-                result.transferred_bytes += line.bytes as i64;
+                result.transferred_bytes += item.bytes as i64;
                 match entry {
                     MirrorEntry::Rdf => {
                         result.rdf_ids.push(book_id);
@@ -422,18 +361,20 @@ impl Mirror {
                         result.transfers.push(MirrorTransfer {
                             book_id,
                             entry,
-                            path: line.name.clone(),
-                            bytes: line.bytes,
+                            path: item.name.clone(),
+                            bytes: item.bytes,
                         });
                     }
                 }
             }
         }
+        Ok(result)
     }
 }
 
 impl PullResult {
-    fn merge(&mut self, other: PullResult) {
+    /// Fold another pull's tally into this one (per-id escalation).
+    pub(crate) fn merge(&mut self, other: PullResult) {
         self.transfers.extend(other.transfers);
         self.removals.extend(other.removals);
         self.rdf_ids.extend(other.rdf_ids);
@@ -453,7 +394,8 @@ impl PullResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{ALT_HOST, FALLBACK_HOST, host_pair};
+    use super::*;
+    use bookshelf_core::{InterruptFlag, RunIntent, write_intent};
 
     #[test]
     fn primary_fallback_gets_pglaf_alternate() {
@@ -472,5 +414,137 @@ mod tests {
             host_pair("mirror.example.org"),
             ("mirror.example.org", FALLBACK_HOST)
         );
+    }
+
+    #[test]
+    fn run_id_parsed_from_frozen_dir_name() {
+        assert_eq!(
+            run_id_of(Path::new("/tmp/run/project-gutenberg-r1234")),
+            1234
+        );
+        assert_eq!(run_id_of(Path::new("/tmp/run/garbage")), 0);
+    }
+
+    /// rsync must be on PATH for the runner probe — skip vacuously where
+    /// it is absent (the daemon tier requires it anyway).
+    fn test_mirror(dest: &Path) -> Option<Mirror> {
+        let Ok(runner) = RsyncRunner::new(InterruptFlag::new()) else {
+            eprintln!("SKIP: rsync not on PATH");
+            return None;
+        };
+        Some(Mirror::new(
+            Arc::new(runner),
+            ALT_HOST,
+            "gutenberg-epub",
+            dest.to_path_buf(),
+            vec![Format::Txt, Format::EpubImages],
+            InterruptFlag::new(),
+        ))
+    }
+
+    #[test]
+    fn full_spec_carries_delete_log_and_parity_hosts() {
+        let Some(mirror) = test_mirror(&std::env::temp_dir().join("bookshelf-mirror-spec")) else {
+            return;
+        };
+        let run_dir = std::env::temp_dir().join("bookshelf-mirror-run-r7");
+        let spec = mirror.full_spec(&run_dir, 1);
+        assert_eq!(spec.run_id, 7);
+        assert_eq!(spec.source, SOURCE_KEY);
+        assert_eq!(spec.run_dir, run_dir);
+        assert!(spec.args.iter().any(|a| a == "--delete"));
+        assert!(
+            spec.args
+                .iter()
+                .any(|a| a == &format!("--log-file={}/itemize.log", run_dir.display()))
+        );
+        assert!(spec.args.iter().any(|a| a == "--log-file-format=%i|%n|%b"));
+        assert!(
+            spec.args
+                .iter()
+                .any(|a| a == "--partial-dir=.rsync-partial")
+        );
+        assert!(!spec.args.iter().any(|a| a == "--itemize-changes"));
+        assert!(
+            spec.args
+                .iter()
+                .any(|a| a.contains("gutenberg-epub/") && a.ends_with("::gutenberg-epub/"))
+        );
+        assert!(spec.args.contains(&format!("{ALT_HOST}::gutenberg-epub/")));
+        // Even attempt → the alternate host.
+        let spec = mirror.full_spec(&run_dir, 2);
+        assert!(
+            spec.args
+                .contains(&format!("{FALLBACK_HOST}::gutenberg-epub/"))
+        );
+    }
+
+    #[test]
+    fn targeted_spec_is_relative_with_one_source_per_id() {
+        let Some(mirror) = test_mirror(&std::env::temp_dir().join("bookshelf-mirror-spec")) else {
+            return;
+        };
+        let run_dir = std::env::temp_dir().join("bookshelf-mirror-run-r9");
+        let spec = mirror.targeted_spec(&run_dir, &[1342, 51564], 1);
+        assert_eq!(spec.run_id, 9);
+        assert!(spec.args.iter().any(|a| a == "--relative"));
+        assert!(
+            spec.args
+                .contains(&format!("{ALT_HOST}::gutenberg-epub/./1342/"))
+        );
+        assert!(
+            spec.args
+                .contains(&format!("{ALT_HOST}::gutenberg-epub/./51564/"))
+        );
+    }
+
+    #[test]
+    fn finalize_maps_itemize_log_to_pull_result() {
+        let Some(mirror) = test_mirror(&std::env::temp_dir().join("bookshelf-mirror-finalize"))
+        else {
+            return;
+        };
+        let run_dir = std::env::temp_dir().join("bookshelf-mirror-finalize-r42");
+        let _ = std::fs::remove_dir_all(&run_dir);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        // Same shapes as tests/rsync_parse.rs.
+        std::fs::write(
+            run_dir.join("itemize.log"),
+            "<f.st......|1342/pg1342-images.epub|24846294\n\
+             >f+++++++++|51564/pg51564.rdf|18220\n\
+             *deleting|1342/pg1342-h.zip|0\n",
+        )
+        .unwrap();
+        write_intent(
+            &run_dir,
+            &RunIntent {
+                attempt: 1,
+                host: ALT_HOST.to_string(),
+                started_at: "2026-08-29T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+
+        let pull = mirror.finalize(&run_dir, 0).unwrap();
+        assert_eq!(pull.rsync_exit, Some(0));
+        assert_eq!(pull.host_used, ALT_HOST);
+        assert!(!pull.interrupted);
+        assert!(!pull.failed);
+        assert_eq!(pull.transferred_files, 2);
+        assert_eq!(pull.transferred_bytes, 24846294 + 18220);
+        assert_eq!(pull.ingest_ids(), vec![51564]);
+        assert_eq!(pull.transfers.len(), 1);
+        assert_eq!(pull.transfers[0].book_id, 1342);
+        assert_eq!(pull.removals.len(), 1);
+
+        // Exit 20 marks the interrupted run AND arms `failed` (20 is in
+        // the Fatal class — the Interrupted mapping clears it at the
+        // caller); other fatal codes arm `failed` alone.
+        let pull = mirror.finalize(&run_dir, 20).unwrap();
+        assert!(pull.interrupted);
+        assert!(pull.failed);
+        let pull = mirror.finalize(&run_dir, 255).unwrap();
+        assert!(pull.failed);
+        let _ = std::fs::remove_dir_all(&run_dir);
     }
 }

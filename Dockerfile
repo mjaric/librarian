@@ -30,8 +30,12 @@ COPY --from=build /usr/local/bin/librarian /usr/local/bin/librarian
 COPY docker/librarian.toml /etc/librarian/librarian.toml
 USER 1000:1000
 WORKDIR /data
-# SIGTERM (docker stop) → graceful shutdown: running job requeued, rsync
-# children group-killed by the kernel; exits 0.
+# SIGTERM (docker stop) → graceful shutdown, exit 0. Supervised transfers
+# detach by default (on_daemon_stop = "detach") — the daemon never kills
+# them — but with this in-container launcher they still die with the
+# container's PID namespace and are requeued by the next boot's adopt;
+# launcher = "docker" transfers outlive container restarts. Attached
+# listing calls stop cooperatively.
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/local/bin/librarian"]
 CMD ["daemon", "--config", "/etc/librarian/librarian.toml"]

@@ -4,11 +4,13 @@
 //! `BOOKSHELF_DATABASE_URL` overrides the file (keeps creds out of it).
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Context;
 use serde::Deserialize;
 
 use crate::gutenberg_org::rdf::Format;
+use crate::supervisor::{LauncherKind, OnStop, SupervisorCfg};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TriageMode {
@@ -43,6 +45,14 @@ pub struct Config {
     /// the host network). Absent → OpenTelemetry is fully disabled: no SDK,
     /// no exporter, no network traffic. Opt-in by design.
     pub otlp_endpoint: Option<String>,
+    /// `[supervisor]` — detached rsync supervision: stop behaviour, poll
+    /// cadence, stall threshold and retry-ladder budget.
+    pub supervisor: SupervisorCfg,
+    /// `[supervisor] launcher`, resolved to a kind at load.
+    pub supervisor_launcher: LauncherKind,
+    /// `[supervisor] docker_image` — required iff
+    /// `launcher = "docker"`; the image must contain rsync.
+    pub docker_image: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -66,6 +76,7 @@ struct ConfigFile {
     triage: Option<String>,
     agent: Option<AgentFile>,
     observability: Option<ObservabilityFile>,
+    supervisor: Option<SupervisorFile>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -79,6 +90,18 @@ struct ObservabilityFile {
 struct AgentFile {
     provider: Option<String>,
     model: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct SupervisorFile {
+    on_daemon_stop: Option<String>,
+    launcher: Option<String>,
+    poll_secs: Option<u64>,
+    progress_stall_secs: Option<u64>,
+    max_attempts: Option<u32>,
+    /// Accepted for forward-compatibility with the docker workstream.
+    docker_image: Option<String>,
 }
 
 /// Expand a leading `~` against $HOME (std does not do it by itself).
@@ -144,6 +167,29 @@ impl Config {
             .or(file.database_url)
             .unwrap_or_else(|| "postgres://bookshelf:bookshelf@localhost:5432/bookshelf".into());
 
+        let sup = file.supervisor.unwrap_or_default();
+        let on_daemon_stop = match sup.on_daemon_stop.as_deref() {
+            None | Some("detach") => OnStop::Detach,
+            Some("kill") => OnStop::Kill,
+            Some(other) => {
+                anyhow::bail!("unknown supervisor on_daemon_stop {other:?} (want detach|kill)")
+            }
+        };
+        let supervisor_launcher = match sup.launcher.as_deref() {
+            None | Some("process") => LauncherKind::Process,
+            Some("docker") => LauncherKind::Docker,
+            Some(other) => {
+                anyhow::bail!("unknown supervisor launcher {other:?} (want process|docker)")
+            }
+        };
+        let docker_image = sup.docker_image;
+        let supervisor = SupervisorCfg {
+            on_daemon_stop,
+            poll: Duration::from_secs(sup.poll_secs.unwrap_or(10)),
+            progress_stall: Duration::from_secs(sup.progress_stall_secs.unwrap_or(30 * 60)),
+            max_attempts: sup.max_attempts.unwrap_or(4),
+        };
+
         let agent = file.agent.unwrap_or_default();
         Ok(Self {
             database_url,
@@ -173,6 +219,9 @@ impl Config {
             agent_provider: agent.provider.unwrap_or_else(|| "zai".into()),
             agent_model: agent.model.unwrap_or_else(|| "glm-5.3".into()),
             otlp_endpoint: file.observability.and_then(|o| o.otlp_endpoint),
+            supervisor,
+            supervisor_launcher,
+            docker_image,
         })
     }
 
@@ -190,6 +239,12 @@ impl Config {
 
     pub fn meta_dir(&self) -> PathBuf {
         self.library_dir.join("meta")
+    }
+
+    /// Detached-run root: `library_dir/run`. Derived — never
+    /// file-settable, like `mirror_dir`/`meta_dir`.
+    pub fn run_root(&self) -> PathBuf {
+        self.library_dir.join("run")
     }
 
     pub fn events_path(&self) -> PathBuf {

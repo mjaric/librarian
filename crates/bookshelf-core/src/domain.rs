@@ -204,6 +204,8 @@ pub enum EventKind {
     TaxonomyUpdated,
     #[serde(rename = "feed.checked")]
     FeedChecked,
+    #[serde(rename = "cycle.adopted")]
+    CycleAdopted,
 }
 
 impl EventKind {
@@ -223,6 +225,7 @@ impl EventKind {
             EventKind::BookFailedPermanent => "book.failed_permanent",
             EventKind::TaxonomyUpdated => "taxonomy.updated",
             EventKind::FeedChecked => "feed.checked",
+            EventKind::CycleAdopted => "cycle.adopted",
         }
     }
 }
@@ -264,4 +267,21 @@ pub struct TriageContext {
 #[async_trait]
 pub trait Triage: Send + Sync {
     async fn decide(&self, ctx: &TriageContext) -> TriageDecision;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cycle_adopted_serializes_to_dot_namespaced_verb() {
+        // The EventLog JSONL writer serializes kinds via `as_str`; the
+        // serde rename (wire name if the enum is ever serialized directly)
+        // must carry the same dot-verb.
+        assert_eq!(EventKind::CycleAdopted.as_str(), "cycle.adopted");
+        assert_eq!(
+            serde_json::to_string(&EventKind::CycleAdopted).unwrap(),
+            "\"cycle.adopted\""
+        );
+    }
 }

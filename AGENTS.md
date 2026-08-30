@@ -31,7 +31,7 @@ Non-negotiable invariants (do not "fix" these):
 
 - **Single worker = serialized cycles — that is the politeness mechanism.** No parallel cycle execution.
 - **`events.jsonl` is append-only.** Never rewritten or truncated; EventLog flushes per line.
-- rsync children run in their own process groups with `PR_SET_PDEATHSIG` (`adapters/rsync.rs`); shutdown is cooperative (`InterruptFlag`: TERM → 10 s → KILL). Don't spawn rsync any other way.
+- rsync has two spawn paths, both owned by `adapters/rsync.rs`: short listing calls run attached (own process group + `PR_SET_PDEATHSIG`); transfer runs are detached (`spawn_detached`: setsid wrapper, no PDEATHSIG) so they outlive daemon restarts, supervised via the run-dir artifact protocol (intent/pid/exit/itemize) and adopted at boot (`Provider::adopt`). Never spawn rsync any other way, and never duplicate the wrapper. Shutdown: cooperative `InterruptFlag` (TERM → 10 s → KILL) on the attached path; `on_daemon_stop` detach|kill on the supervised path.
 - All HTTP goes through `PoliteClient` (global rate limiter `request_interval_ms` + concurrency semaphore). Never fetch Gutenberg HTML pages — the mirror carries metadata.
 - **Trait discipline** (documented in `domain.rs:7-10`): no ~25-method trait for one impl. `StorePostgres` is deliberately a concrete struct; extract a trait from real usage only when a second backend exists.
 
@@ -75,7 +75,7 @@ No CI exists — verification is the manual loop above. No rustfmt/clippy config
 - **sqlx**: runtime `query`/`query_as` only — **no macros**, no compile-time `DATABASE_URL`, no `.sqlx` cache. `FromRow` derive only. Migrations embedded via `sqlx::migrate!` and auto-applied by every subcommand (`open_store`, `main.rs:134-136`); idempotent via `_sqlx_migrations`.
 - **Dependencies**: exact `=` pins, hand-duplicated across crate manifests (no `[workspace.dependencies]`) — a version bump edits every manifest that names the crate + `cargo update -p <crate>`. Feature `agent` (default, core + librarian only) gates `rig-core`. `wasm-bindgen-cli` (installed tool) must match the `wasm-bindgen` crate pin in `bookshelf-ui`.
 - **Config** (`crates/librarian/src/config.rs`): `ConfigFile` is `#[serde(deny_unknown_fields)]` — adding a key means adding the struct field or every run with the old file fails. Search order `--config` → `$BOOKSHELF_CONFIG` → `./librarian.toml`; env `BOOKSHELF_DATABASE_URL` always overrides the file; `~` expanded; derived paths (`mirror_dir`, `meta_dir`, `events_path`) are never file-settable.
-- **Naming**: event kinds are dot-namespaced verbs (`book.discovered`, `file.transferred`, `feed.checked`, …); provider module `gutenberg_org` vs source key `project-gutenberg`; DB rows all carry `source`.
+- **Naming**: event kinds are dot-namespaced verbs (`book.discovered`, `file.transferred`, `feed.checked`, `cycle.adopted`, …); provider module `gutenberg_org` vs source key `project-gutenberg`; DB rows all carry `source`.
 - **Commits**: `<binary>: <imperative lowercase summary>` + structured body (see `git log`).
 
 ## Important Files
@@ -84,6 +84,7 @@ No CI exists — verification is the manual loop above. No rustfmt/clippy config
 - `crates/librarian/src/config.rs` — every tunable + defaults
 - `crates/librarian/src/provider.rs` — Provider trait + registry (`resolve`, `ensure_known_key`)
 - `crates/librarian/src/queue.rs` — enqueue/coalesce/pick/requeue semantics
+- `crates/librarian/src/supervisor.rs` / `supervisor_docker.rs` — detached-run supervision: poll state machine + transport ladder, process/docker launchers behind `SyncLauncher`
 - `crates/librarian/src/gutenberg_org/{mod,mirror,feed,rdf,taxonomy}.rs` — provider internals; taxonomy seed is a hardcoded snapshot (RDF leaves are source of truth; unknown leaves → `Unassigned`)
 - `crates/bookshelf-core/src/domain.rs` — domain types + ports + the trait-discipline rationale
 - `librarian-smoke.toml` — the only safe config for disk-touching runs (`library_dir=./library-smoke`, `feed_check_days=0`, `backfill_on_start=false`)
@@ -98,9 +99,8 @@ No CI exists — verification is the manual loop above. No rustfmt/clippy config
 
 ## Testing & QA
 
-- 23 tests: per-crate integration tests in `crates/*/tests/` (RDF parse vs verbatim `fixtures/pg1342.rdf`, feed, itemize, triage ladder, taxonomy, event log, queue semantics, catalog reads `catalog_reads.rs`) + 2 inline unit tests (`triage_agent.rs:211-240`, reply parsing).
+- 98 tests: per-crate integration tests in `crates/*/tests/` (RDF parse vs verbatim `fixtures/pg1342.rdf`, feed, itemize, triage ladder, taxonomy, event log, queue semantics, catalog reads `catalog_reads.rs`; detached-run supervision: `supervisor_docker.rs` drives a fake `docker` bin, `rsync_detached.rs` runs a real local rsync, `adopt.rs` exercises boot adoption) + 58 inline unit tests (supervisor ladder state machine with its scripted `FakeLauncher`, mirror specs/finalize, rsync runner/wrapper primitives incl. the log-file line shapes, domain, observability, monitor, `triage_agent.rs` reply parsing).
 - Web tier: `cargo run -p xtask -- dist` then `cargo run -p librarian-web -- --config librarian-smoke.toml`; verify pages at http://127.0.0.1:8787 (home search, category shelves, book page). The wasm bundle needs `rustup target add wasm32-unknown-unknown` + matching `wasm-bindgen-cli`.
 - Fixtures live in `crates/librarian/tests/fixtures/` and load via `CARGO_MANIFEST_DIR`-relative paths (not `include_str!`); parser tests elsewhere use inline `const LINES` arrays.
 - **DB-gated tests self-skip** by early `return` when `BOOKSHELF_DATABASE_URL` is unset — they are not `#[ignore]`d and pass vacuously without the var. They also **mutate the DB they point at** (probe rows `source='store-test'`, job-kind deletes): point them at a scratch DB.
-- Smoke tier: run the real binary with `librarian-smoke.toml`, verify by reading `library-smoke/events.jsonl` — no assertions involved.
-- Known untested surfaces — add fixture coverage when touching: CLI/daemon lifecycle (SIGTERM, `--wait`, scheduler), `config.rs` loading, `PoliteClient`, `RsyncRunner` process handling, most of the store beyond the roundtrip, ingest→DB path.
+- Known untested surfaces — add fixture coverage when touching: CLI/daemon lifecycle (SIGTERM, `--wait`, scheduler), `config.rs` loading, `PoliteClient`, the attached `RsyncRunner` (`--list-only`) spawn path — the detached path is covered by `rsync.rs` unit tests + `rsync_detached.rs` — most of the store beyond the roundtrip, ingest→DB path.

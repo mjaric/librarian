@@ -3,7 +3,8 @@
 //! DATABASE_URL at compile time and no offline `.sqlx` cache.
 
 use anyhow::Context;
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::pool::PoolConnection;
+use sqlx::postgres::{PgPool, PgPoolOptions, Postgres};
 use time::OffsetDateTime;
 
 use crate::domain::{
@@ -149,6 +150,47 @@ impl StorePostgres {
         .fetch_all(&self.pool)
         .await?;
         Ok(runs)
+    }
+
+    /// Newest unfinished run for one source — the row a supervisor binds to
+    /// when adopting a detached rsync (None = nothing in flight).
+    pub async fn open_run(&self, source: &str) -> anyhow::Result<Option<i64>> {
+        let id: Option<(i64,)> = sqlx::query_as(
+            "SELECT id FROM sync_runs WHERE source = $1 AND finished_at IS NULL \
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(source)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(id.map(|r| r.0))
+    }
+
+    /// Close every still-open run row for one source as 'abandoned' — the boot
+    /// sweep for runs whose daemon died without run-dir artifacts (adoption
+    /// closes the artifact-bearing ones). Returns rows closed.
+    pub async fn abort_stale_runs(&self, source: &str) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE sync_runs SET finished_at = now(), aborted_reason = 'abandoned' \
+             WHERE source = $1 AND finished_at IS NULL",
+        )
+        .bind(source)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Live progress projection for a run (poll the detached run dir's
+    /// itemize deltas into here); `finish_run` owns the final values.
+    pub async fn update_run_progress(&self, id: i64, files: i64, bytes: i64) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE sync_runs SET transferred_files = $2, transferred_bytes = $3 WHERE id = $1",
+        )
+        .bind(id)
+        .bind(files as i32)
+        .bind(bytes)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     // -- books -----------------------------------------------------------
@@ -676,12 +718,57 @@ impl StorePostgres {
         Ok(rows)
     }
 
-    /// Requeue jobs stuck in `running` (daemon died mid-job). Returns count.
-    pub async fn reclaim_running_jobs(&self) -> anyhow::Result<u64> {
-        let res = sqlx::query("UPDATE jobs SET status = 'queued' WHERE status = 'running'")
-            .execute(&self.pool)
-            .await?;
-        Ok(res.rows_affected())
+    // -- executor fence (detached-run supervision) ---------------------------
+
+    /// Take the singleton executor advisory lock for `name` (the source key).
+    /// Fails fast when another daemon already owns execution. The returned
+    /// guard holds the checked-out pool connection — and with it the Postgres
+    /// session owning the lock — for its whole life: sqlx reaping only
+    /// touches idle-in-pool connections, and returning the conn to the pool
+    /// on drop keeps the session (and the lock) alive until pool shutdown at
+    /// daemon exit. That persistence is intended.
+    pub async fn executor_lock(&self, name: &str) -> anyhow::Result<ExecutorGuard> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .with_context(|| format!("acquiring a session for the executor lock ({name})"))?;
+        let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext($1)::bigint)")
+            .bind(name)
+            .fetch_one(&mut *conn)
+            .await
+            .with_context(|| format!("trying the executor advisory lock ({name})"))?;
+        anyhow::ensure!(
+            got,
+            "another daemon owns execution (advisory lock {name:?} already held)"
+        );
+        Ok(ExecutorGuard {
+            _conn: tokio::sync::Mutex::new(conn),
+        })
+    }
+}
+
+/// Session-scoped advisory-lock fence returned by
+/// [`StorePostgres::executor_lock`]. The guard holds the checked-out
+/// [`PoolConnection`] for its whole life; the lock lives as long as the
+/// session. sqlx reaping only touches idle-in-pool connections, and
+/// returning the conn to the pool on drop keeps the session (and the lock)
+/// alive until pool shutdown at daemon exit — intended. The connection sits
+/// in a mutex only because the frozen `ping(&self)` hands out shared access.
+pub struct ExecutorGuard {
+    _conn: tokio::sync::Mutex<PoolConnection<Postgres>>,
+}
+
+impl ExecutorGuard {
+    /// Cheap session-liveness probe (`SELECT 1` on the fenced connection).
+    pub async fn ping(&self) -> anyhow::Result<()> {
+        let mut conn = self._conn.lock().await;
+        let one: i32 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(&mut **conn)
+            .await
+            .context("executor session ping failed")?;
+        anyhow::ensure!(one == 1, "executor session ping returned {one}");
+        Ok(())
     }
 }
 
@@ -721,5 +808,153 @@ impl StorePostgres {
         .fetch_all(&self.pool)
         .await?;
         Ok(files)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// DB-gated: every test self-skips (vacuous pass) without
+    /// BOOKSHELF_DATABASE_URL. Each test gets its OWN pool, created and
+    /// closed entirely inside its own tokio runtime — a shared static pool
+    /// binds its bookkeeping to whichever runtime created it first and then
+    /// starves later tests' runtimes (PoolTimedOut), and a connection still
+    /// checked out at runtime teardown can never return to any pool.
+    /// Concurrent `migrate()` is safe: the migrator serializes on a Postgres
+    /// advisory lock. Probe rows are inert — `supervisor-test*` sources,
+    /// deleted before and after each probe.
+    async fn fresh_store() -> Option<StorePostgres> {
+        let Ok(url) = std::env::var("BOOKSHELF_DATABASE_URL") else {
+            eprintln!("SKIP: BOOKSHELF_DATABASE_URL not set");
+            return None;
+        };
+        let store = StorePostgres::connect(&url)
+            .await
+            .expect("connect test store");
+        store.migrate().await.expect("migrate test store");
+        Some(store)
+    }
+
+    async fn clean_probe_runs(store: &StorePostgres, source: &str) {
+        sqlx::query("DELETE FROM sync_runs WHERE source = $1")
+            .bind(source)
+            .execute(store.pool())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn executor_lock_is_singleton_per_name() {
+        let Some(store) = fresh_store().await else {
+            return;
+        };
+        const NAME: &str = "supervisor-test-executor";
+        let guard = store.executor_lock(NAME).await.unwrap();
+        let Err(err) = store.executor_lock(NAME).await else {
+            panic!("second executor_lock must fail while the first session holds it");
+        };
+        assert!(
+            err.to_string().contains("another daemon owns execution"),
+            "wrong error: {err:#}"
+        );
+        guard.ping().await.unwrap();
+        // Deterministic teardown INSIDE the live runtime: drop returns the
+        // conn to this test's pool (the idle session still holds the
+        // advisory lock, by design), then close() ends the session — the
+        // lock dies with it before the runtime goes away. No unlock API
+        // exists; the session end is the unlock.
+        drop(guard);
+        store.pool().close().await;
+    }
+
+    #[tokio::test]
+    async fn open_run_returns_newest_unfinished() {
+        let Some(store) = fresh_store().await else {
+            return;
+        };
+        const SOURCE: &str = "supervisor-test-open";
+        clean_probe_runs(&store, SOURCE).await;
+        assert_eq!(store.open_run(SOURCE).await.unwrap(), None);
+        let first = store.start_run(SOURCE, "full").await.unwrap();
+        let second = store.start_run(SOURCE, "feed").await.unwrap();
+        store
+            .finish_run(second, Some(0), 0, 0, 0, 0, 0, 0, None)
+            .await
+            .unwrap();
+        let newest = store.start_run(SOURCE, "full").await.unwrap();
+        assert_eq!(
+            store.open_run(SOURCE).await.unwrap(),
+            Some(newest),
+            "adoption binds to the newest unfinished run"
+        );
+        store
+            .finish_run(newest, Some(0), 0, 0, 0, 0, 0, 0, None)
+            .await
+            .unwrap();
+        assert_eq!(store.open_run(SOURCE).await.unwrap(), Some(first));
+        clean_probe_runs(&store, SOURCE).await;
+        assert_eq!(store.open_run(SOURCE).await.unwrap(), None);
+        store.pool().close().await;
+    }
+
+    #[tokio::test]
+    async fn update_run_progress_roundtrips() {
+        let Some(store) = fresh_store().await else {
+            return;
+        };
+        const SOURCE: &str = "supervisor-test-progress";
+        clean_probe_runs(&store, SOURCE).await;
+        let id = store.start_run(SOURCE, "full").await.unwrap();
+        store.update_run_progress(id, 12, 3_456_789).await.unwrap();
+        let (files, bytes): (i32, i64) = sqlx::query_as(
+            "SELECT transferred_files, transferred_bytes FROM sync_runs WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!((i64::from(files), bytes), (12, 3_456_789));
+        clean_probe_runs(&store, SOURCE).await;
+        store.pool().close().await;
+    }
+
+    #[tokio::test]
+    async fn abort_stale_runs_closes_only_open_rows() {
+        let Some(store) = fresh_store().await else {
+            return;
+        };
+        const SOURCE: &str = "supervisor-test-abort";
+        clean_probe_runs(&store, SOURCE).await;
+        let done = store.start_run(SOURCE, "feed").await.unwrap();
+        store
+            .finish_run(done, Some(0), 0, 0, 0, 0, 0, 0, None)
+            .await
+            .unwrap();
+        let stale = store.start_run(SOURCE, "full").await.unwrap();
+        assert_eq!(store.abort_stale_runs(SOURCE).await.unwrap(), 1);
+        let rows: Vec<SyncRun> =
+            sqlx::query_as("SELECT * FROM sync_runs WHERE source = $1 ORDER BY id")
+                .bind(SOURCE)
+                .fetch_all(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(rows.len(), 2);
+        let done_row = rows.iter().find(|r| r.id == done).unwrap();
+        assert!(done_row.finished_at.is_some());
+        assert_eq!(
+            done_row.aborted_reason, None,
+            "already-finished row untouched"
+        );
+        let stale_row = rows.iter().find(|r| r.id == stale).unwrap();
+        assert!(stale_row.finished_at.is_some(), "stale open row closed");
+        assert_eq!(stale_row.aborted_reason.as_deref(), Some("abandoned"));
+        assert_eq!(
+            store.abort_stale_runs(SOURCE).await.unwrap(),
+            0,
+            "second sweep finds nothing open"
+        );
+        clean_probe_runs(&store, SOURCE).await;
+        store.pool().close().await;
     }
 }

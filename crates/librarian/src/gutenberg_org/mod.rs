@@ -8,17 +8,20 @@ pub mod mirror;
 pub mod rdf;
 pub mod taxonomy;
 
+use anyhow::Context as _;
 use async_trait::async_trait;
 use bookshelf_core::domain::{EventKind, EventSink, Json, Triage};
 use bookshelf_core::triage_rules;
 use bookshelf_core::{
-    ActiveRun, FetchError, InterruptFlag, PoliteClient, RsyncRunner, StorePostgres,
+    ActiveRun, FetchError, InterruptFlag, PoliteClient, RsyncRunner, RunIntent, StorePostgres,
+    read_intent,
 };
 use opentelemetry::Context;
 use opentelemetry::KeyValue;
 use opentelemetry::global::BoxedSpan;
 use opentelemetry::trace::{Span as _, SpanContext, TraceContextExt, Tracer as _};
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -27,7 +30,13 @@ use time::OffsetDateTime;
 use crate::config::{Config, TriageMode};
 use crate::observability::{Observability, phase_span_name};
 use crate::provider::{
-    CycleOpts, CycleReport, ProgressReport, Provider, RepairReport, StatusReport,
+    AdoptAction, AdoptReport, CycleOpts, CycleReport, ProgressReport, Provider, RepairReport,
+    StatusReport,
+};
+use crate::queue::{JobQueue, JobRow};
+use crate::supervisor::{
+    Observation, RsyncSpec, SuperviseOutcome, SupervisorCfg, SyncLauncher, read_args_json,
+    supervise,
 };
 use mirror::{Mirror, MirrorLive, PullResult};
 use rdf::MirrorEntry;
@@ -41,6 +50,11 @@ pub struct GutenbergOrg {
     http: Arc<PoliteClient>,
     mirror: Mirror,
     interrupt: InterruptFlag,
+    /// Detached-run launcher (process today; docker is a later
+    /// workstream). Every transfer goes through the supervisor with it.
+    launcher: Arc<dyn SyncLauncher>,
+    /// `[supervisor]` knobs (stop policy, poll cadence, ladder budget).
+    supervisor: SupervisorCfg,
     triage: Option<Arc<dyn Triage>>,
     /// Attached once by the daemon (`Provider::set_observability`); None on
     /// CLI-only paths.
@@ -52,6 +66,7 @@ impl GutenbergOrg {
         store: Arc<StorePostgres>,
         events: Arc<dyn EventSink>,
         interrupt: InterruptFlag,
+        launcher: Arc<dyn SyncLauncher>,
     ) -> anyhow::Result<Self> {
         let http = PoliteClient::new(
             &cfg.user_agent(),
@@ -99,6 +114,7 @@ impl GutenbergOrg {
         if let Some(desc) = &agent_desc {
             tracing::info!(agent = %desc, "LLM triage agent enabled");
         }
+        let supervisor = cfg.supervisor.clone();
         Ok(Self {
             cfg,
             store,
@@ -106,6 +122,8 @@ impl GutenbergOrg {
             http: Arc::new(http),
             mirror,
             interrupt,
+            launcher,
+            supervisor,
             triage,
             obs: OnceLock::new(),
         })
@@ -541,6 +559,203 @@ impl GutenbergOrg {
             }
         }
     }
+    /// -----------------------------------------------------------------
+    /// Detached-run supervision (spec → supervise → finalize)
+    /// -----------------------------------------------------------------
+
+    /// The frozen run-dir naming: `<run_root>/<source>-r<run_id>`.
+    fn run_dir_for(&self, run_id: i64) -> PathBuf {
+        self.cfg.run_root().join(format!("{SOURCE_KEY}-r{run_id}"))
+    }
+
+    /// One supervised transfer folded into the cycle's PullResult
+    /// vocabulary. `Detached` is its own outcome on purpose: a detached
+    /// run must NOT be finalized and its run row must NOT be finished —
+    /// the open row + running job + run-dir artifacts are exactly the
+    /// durable handles the next daemon's `adopt` resumes from.
+    async fn supervise_transfer(&self, spec: &RsyncSpec) -> anyhow::Result<PullOutcome> {
+        match supervise(
+            self.launcher.as_ref(),
+            spec,
+            &self.supervisor,
+            &self.interrupt,
+            &self.store,
+        )
+        .await?
+        {
+            SuperviseOutcome::Completed { code } => Ok(PullOutcome::Done(
+                self.mirror.finalize(&spec.run_dir, code)?,
+            )),
+            // 20 = rsync aborted-by-signal, i.e. our own terminate paths.
+            // 20 classifies Fatal, so finalize arms `failed` — but an
+            // interruption requeues and retries, it is not a failure (and
+            // feed_cycle's reason mapping checks `failed` first).
+            SuperviseOutcome::Interrupted => {
+                let mut pull = self.mirror.finalize(&spec.run_dir, 20)?;
+                pull.failed = false;
+                Ok(PullOutcome::Interrupted(pull))
+            }
+            SuperviseOutcome::LeftRunning => Ok(PullOutcome::Detached),
+            SuperviseOutcome::Failed { code, .. } => {
+                let mut pull = match code {
+                    Some(c) => self.mirror.finalize(&spec.run_dir, c)?,
+                    None => PullResult::default(),
+                };
+                // Exhaustion is a caller-visible fact: finalize only sees
+                // the last exit code, which alone would read recoverable.
+                pull.failed = true;
+                Ok(PullOutcome::Failed(pull))
+            }
+        }
+    }
+
+    /// Full-module transfer under supervision. `None` ⇒ detached.
+    async fn supervised_full(&self, run_id: i64) -> anyhow::Result<Option<PullResult>> {
+        let run_dir = self.run_dir_for(run_id);
+        let spec = self.mirror.full_spec(&run_dir, 1);
+        Ok(Some(match self.supervise_transfer(&spec).await? {
+            PullOutcome::Done(pull)
+            | PullOutcome::Interrupted(pull)
+            | PullOutcome::Failed(pull) => pull,
+            PullOutcome::Detached => return Ok(None),
+        }))
+    }
+
+    /// Targeted transfer under supervision, with the preserved per-id
+    /// escalation after a failed multi-source batch. `None` ⇒ detached.
+    /// Politeness: strictly sequential supervision — `supervise` runs
+    /// exactly one rsync at a time, so there are never two concurrent
+    /// transfers.
+    async fn supervised_targeted(
+        &self,
+        run_id: i64,
+        ids: &[i64],
+    ) -> anyhow::Result<Option<PullResult>> {
+        let run_dir = self.run_dir_for(run_id);
+        let spec = self.mirror.targeted_spec(&run_dir, ids, 1);
+        match self.supervise_transfer(&spec).await? {
+            PullOutcome::Detached => Ok(None),
+            PullOutcome::Failed(_) if ids.len() > 1 => {
+                match self.escalate_targeted(&run_dir, ids).await? {
+                    Some(pull) => Ok(Some(pull)),
+                    None => Ok(None),
+                }
+            }
+            outcome => Ok(Some(match outcome {
+                PullOutcome::Done(pull)
+                | PullOutcome::Interrupted(pull)
+                | PullOutcome::Failed(pull) => pull,
+                PullOutcome::Detached => unreachable!("handled above"),
+            })),
+        }
+    }
+
+    /// Per-id escalation after a failed batch `--relative` pull: every id
+    /// gets its own supervised transfer (with the full ladder); ids that
+    /// still fail individually are skipped. `None` ⇒ detached mid-escalation.
+    async fn escalate_targeted(
+        &self,
+        run_dir: &Path,
+        ids: &[i64],
+    ) -> anyhow::Result<Option<PullResult>> {
+        let mut combined = PullResult::default();
+        let mut any_ok = false;
+        for id in ids {
+            if self.interrupt.is_set() {
+                combined.interrupted = true;
+                break;
+            }
+            let spec = self.mirror.targeted_spec(run_dir, &[*id], 1);
+            match self.supervise_transfer(&spec).await? {
+                PullOutcome::Done(pull) => {
+                    if combined.host_used.is_empty() {
+                        combined.host_used = pull.host_used.clone();
+                    }
+                    combined.merge(pull);
+                    any_ok = true;
+                }
+                PullOutcome::Interrupted(pull) => {
+                    combined.merge(pull);
+                    combined.interrupted = true;
+                    break;
+                }
+                PullOutcome::Detached => return Ok(None),
+                PullOutcome::Failed(pull) => combined.merge(pull),
+            }
+        }
+        if any_ok || !combined.transfers.is_empty() {
+            combined.failed = false;
+        }
+        Ok(Some(combined))
+    }
+
+    /// `<run_root>/<SOURCE_KEY>-r<run_id>` dirs, newest (highest run id)
+    /// first. Missing run root ⇒ empty.
+    fn scan_run_dirs(&self) -> anyhow::Result<Vec<(i64, PathBuf)>> {
+        let root = self.cfg.run_root();
+        let prefix = format!("{SOURCE_KEY}-r");
+        let mut dirs = Vec::new();
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(dirs),
+            Err(e) => return Err(e).context(format!("scanning run root {}", root.display())),
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(id) = name
+                .strip_prefix(&prefix)
+                .and_then(|s| s.parse::<i64>().ok())
+            {
+                dirs.push((id, entry.path()));
+            }
+        }
+        dirs.sort_by(|a, b| b.0.cmp(&a.0));
+        Ok(dirs)
+    }
+
+    /// The spec for an adopted run: the exact recorded args whenever the
+    /// supervisor wrote `args.json` (every spawn does). Without it, fall
+    /// back to a kind-based reconstruction — full for plain full cycles,
+    /// targeted for `only`; feed/limit runs fall back to full because
+    /// their id sets are not recoverable from durable state.
+    fn adopt_spec(
+        &self,
+        run_dir: &Path,
+        run_id: i64,
+        job: &JobRow,
+        intent: &RunIntent,
+    ) -> anyhow::Result<RsyncSpec> {
+        if let Some(args) = read_args_json(run_dir)? {
+            return Ok(RsyncSpec {
+                source: SOURCE_KEY.to_string(),
+                run_id,
+                args,
+                run_dir: run_dir.to_path_buf(),
+            });
+        }
+        if job.kind == "full_cycle" {
+            let opts: CycleOpts = serde_json::from_value(job.payload.clone()).unwrap_or_default();
+            if !opts.only.is_empty() {
+                return Ok(self
+                    .mirror
+                    .targeted_spec(run_dir, &opts.only, intent.attempt));
+            }
+        }
+        Ok(self.mirror.full_spec(run_dir, intent.attempt))
+    }
+}
+
+/// A transfer's supervise outcome folded into the cycle's PullResult
+/// vocabulary (mod-internal). `Detached` stays separate so callers cannot
+/// accidentally finish a run row for a run that is still alive.
+enum PullOutcome {
+    Done(PullResult),
+    Interrupted(PullResult),
+    Failed(PullResult),
+    Detached,
 }
 
 /// tokio-friendly JSON sidecar write.
@@ -776,6 +991,230 @@ impl Provider for GutenbergOrg {
         let _ = self.obs.set(obs);
     }
 
+    /// Boot-time adoption: scan the run root for leftover detached-run
+    /// dirs, bind the running job, and either resume/finalize the transfer
+    /// through the same state machine as fresh runs, or requeue/complete
+    /// the job. Runs BEFORE the scheduler/worker (see `run_daemon`).
+    async fn adopt(&self) -> anyhow::Result<AdoptReport> {
+        let dirs = self.scan_run_dirs()?;
+        if dirs.is_empty() {
+            return Ok(AdoptReport::default());
+        }
+        let queue = JobQueue::new(self.store.pool().clone());
+        let running = queue
+            .recent(SOURCE_KEY, 50)
+            .await?
+            .into_iter()
+            .find(|job| job.status == "running");
+        let Some(job) = running else {
+            // Artifacts without a running job: the run row finished (or
+            // the job was already reaped). Kill anything still alive and
+            // reap every dir — through the launcher, so a docker run is
+            // stopped+removed as a container instead of TERMed by the
+            // container-internal pid in its pid file.
+            for (run_id, dir) in &dirs {
+                tracing::warn!(
+                    run_id,
+                    dir = %dir.display(),
+                    "orphan run artifacts without a running job — terminating and reaping"
+                );
+                let spec = RsyncSpec {
+                    source: SOURCE_KEY.to_string(),
+                    run_id: *run_id,
+                    args: Vec::new(),
+                    run_dir: dir.clone(),
+                };
+                self.launcher.terminate(&spec)?;
+                self.launcher.reap(&spec)?;
+            }
+            return Ok(AdoptReport::default());
+        };
+        // The bound dir is the job's own run when known, else the newest.
+        let bound = dirs
+            .iter()
+            .find(|(id, _)| Some(*id) == job.run_id)
+            .unwrap_or(&dirs[0])
+            .clone();
+        for (run_id, dir) in &dirs {
+            if *run_id != bound.0 {
+                // Leftovers of older, finished runs that never got reaped.
+                tracing::warn!(run_id, dir = %dir.display(), "stale run artifacts — reaping");
+                let spec = RsyncSpec {
+                    source: SOURCE_KEY.to_string(),
+                    run_id: *run_id,
+                    args: Vec::new(),
+                    run_dir: dir.clone(),
+                };
+                self.launcher.terminate(&spec)?;
+                self.launcher.reap(&spec)?;
+            }
+        }
+        let (run_id, run_dir) = bound;
+
+        // Malformed/empty dir (no intent): nothing adoptable — reap
+        // through the launcher (missing containers are tolerated).
+        let Some(intent) = read_intent(&run_dir)? else {
+            let spec = RsyncSpec {
+                source: SOURCE_KEY.to_string(),
+                run_id,
+                args: Vec::new(),
+                run_dir: run_dir.clone(),
+            };
+            self.launcher.terminate(&spec)?;
+            self.launcher.reap(&spec)?;
+            tracing::warn!(run_id, job = job.id, "run dir without intent — reaped");
+            return Ok(AdoptReport {
+                job_id: Some(job.id),
+                action: AdoptAction::Nothing,
+            });
+        };
+
+        // Same state machine as fresh runs, adopted at the recorded
+        // attempt. The spec is needed early: the dead-run pre-check below
+        // goes through the launcher's observe (exit file, then
+        // process/container liveness) — never raw /proc, whose pid file
+        // holds a container-internal pid under the docker launcher.
+        let spec = self.adopt_spec(&run_dir, run_id, &job, &intent)?;
+
+        // Dead-unreaped / intent-only (no exit, no live process): nothing
+        // alive or finalized to resume — the interrupted-job path owns the
+        // recovery. Close the abandoned run row so the DB stays honest.
+        if matches!(
+            self.launcher.observe(&spec)?,
+            Observation::DeadUnreaped | Observation::Absent
+        ) {
+            tracing::warn!(
+                run_id,
+                job = job.id,
+                attempt = intent.attempt,
+                "detached run died without an exit record — requeueing job"
+            );
+            self.store
+                .finish_run(run_id, None, 0, 0, 0, 0, 0, 0, Some("interrupted"))
+                .await?;
+            return Ok(AdoptReport {
+                job_id: Some(job.id),
+                action: AdoptAction::Requeued,
+            });
+        }
+
+        // Boot-critical record: awaited via `ev_now` (like feed.checked) so
+        // the line is flushed before supervision proceeds.
+        self.ev_now(
+            EventKind::CycleAdopted,
+            None,
+            serde_json::json!({
+                "run_id": run_id,
+                "job_id": job.id,
+                "attempt": intent.attempt,
+            }),
+        )
+        .await;
+
+        // Same state machine as fresh runs, adopted at the recorded attempt.
+        let guard = ActiveRunGuard::start(
+            self.store.clone(),
+            self.mirror.live(),
+            self.obs.get().cloned(),
+            ActiveRun {
+                job_id: job.id,
+                run_id: Some(run_id),
+                kind: "adopt".into(),
+                phase: "transferring".into(),
+                started_at: rfc3339_now(),
+                files: 0,
+                bytes: 0,
+                last_item_at: None,
+                host: None,
+            },
+        )
+        .await;
+        match supervise(
+            self.launcher.as_ref(),
+            &spec,
+            &self.supervisor,
+            &self.interrupt,
+            &self.store,
+        )
+        .await?
+        {
+            SuperviseOutcome::Completed { code } => {
+                let pull = self.mirror.finalize(&run_dir, code)?;
+                let mut report = CycleReport {
+                    run_id,
+                    transferred_files: pull.transferred_files,
+                    transferred_bytes: pull.transferred_bytes,
+                    ..Default::default()
+                };
+                self.cycle_tail(&pull, &mut report, true, &[], &guard)
+                    .await?;
+                self.store
+                    .finish_run(
+                        run_id,
+                        pull.rsync_exit,
+                        pull.transferred_files,
+                        pull.transferred_bytes,
+                        report.new_books,
+                        report.enriched,
+                        0,
+                        0,
+                        report.aborted_reason.as_deref(),
+                    )
+                    .await?;
+                self.launcher.reap(&spec)?;
+                Ok(AdoptReport {
+                    job_id: Some(job.id),
+                    action: AdoptAction::AdoptedAndCompleted { run_id },
+                })
+            }
+            SuperviseOutcome::Interrupted => {
+                // Stop raced the adoption: the run ended, the job retries.
+                self.store
+                    .finish_run(run_id, None, 0, 0, 0, 0, 0, 0, Some("interrupted"))
+                    .await?;
+                Ok(AdoptReport {
+                    job_id: Some(job.id),
+                    action: AdoptAction::Requeued,
+                })
+            }
+            SuperviseOutcome::LeftRunning => {
+                // Detach raced the adoption: the transfer SURVIVES, so the
+                // run row stays open and the job stays `running` — the next
+                // daemon's adopt binds job + artifacts and resumes it,
+                // exactly the full_cycle detached semantics. Touch neither:
+                // finishing or requeueing here would make the next boot see
+                // an orphan and kill a perfectly healthy rsync.
+                Ok(AdoptReport {
+                    job_id: Some(job.id),
+                    action: AdoptAction::LeftDetached,
+                })
+            }
+            SuperviseOutcome::Failed { reason, code } => {
+                let pull = match code {
+                    Some(c) => self.mirror.finalize(&run_dir, c)?,
+                    None => PullResult::default(),
+                };
+                self.store
+                    .finish_run(
+                        run_id,
+                        pull.rsync_exit,
+                        pull.transferred_files,
+                        pull.transferred_bytes,
+                        0,
+                        0,
+                        0,
+                        0,
+                        Some("rsync_failed"),
+                    )
+                    .await?;
+                Ok(AdoptReport {
+                    job_id: Some(job.id),
+                    action: AdoptAction::Failed(reason),
+                })
+            }
+        }
+    }
+
     async fn full_cycle(&self, opts: CycleOpts) -> anyhow::Result<CycleReport> {
         let run_id = self.store.start_run(SOURCE_KEY, "full").await?;
         let mut report = CycleReport {
@@ -814,8 +1253,8 @@ impl Provider for GutenbergOrg {
         }
 
         guard.set_phase("transferring");
-        let pull = if !opts.only.is_empty() {
-            self.mirror.targeted_pull(&opts.only).await
+        let pulled = if !opts.only.is_empty() {
+            self.supervised_targeted(run_id, &opts.only).await?
         } else if let Some(n) = opts.limit {
             let ids = self.mirror.list_ids(n).await;
             if ids.is_empty() {
@@ -825,9 +1264,16 @@ impl Provider for GutenbergOrg {
                 report.aborted_reason = Some("rsync_failed".into());
                 anyhow::bail!("module listing returned no ids (host unreachable?)");
             }
-            self.mirror.targeted_pull(&ids).await
+            self.supervised_targeted(run_id, &ids).await?
         } else {
-            self.mirror.full_pull().await
+            self.supervised_full(run_id).await?
+        };
+        let Some(pull) = pulled else {
+            // Detached mid-transfer: NEVER finish_run — the open sync_runs
+            // row + running job + run-dir artifacts are the durable handles
+            // the next daemon's adopt() resumes from.
+            report.aborted_reason = Some("detached".into());
+            return Ok(report);
         };
 
         report.transferred_files = pull.transferred_files;
@@ -936,7 +1382,14 @@ impl Provider for GutenbergOrg {
         let pull = if pulled.is_empty() {
             mirror::PullResult::default()
         } else {
-            self.mirror.targeted_pull(&pulled).await
+            match self.supervised_targeted(run_id, &pulled).await? {
+                Some(pull) => pull,
+                None => {
+                    // Detached: the run stays open for the next daemon.
+                    report.aborted_reason = Some("detached".into());
+                    return Ok(report);
+                }
+            }
         };
         report.transferred_files = pull.transferred_files;
         report.transferred_bytes = pull.transferred_bytes;
@@ -1903,6 +2356,9 @@ mod tests {
             agent_provider: String::new(),
             agent_model: String::new(),
             otlp_endpoint: None,
+            supervisor: crate::supervisor::SupervisorCfg::default(),
+            supervisor_launcher: crate::supervisor::LauncherKind::Process,
+            docker_image: None,
         }
     }
 

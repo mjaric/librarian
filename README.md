@@ -33,8 +33,10 @@ web UI (search, category shelves, book pages with downloads). First provider:
   (priority 0) always outrank CLI jobs (priority 10); pickup uses
   `FOR UPDATE SKIP LOCKED`.
 - Single worker = serialized cycles — that is the politeness mechanism.
-  rsync children run in their own process groups with `PR_SET_PDEATHSIG`,
-  so no ghost process can outlive the daemon.
+  rsync listing calls are attached children (own process group +
+  `PR_SET_PDEATHSIG`); transfer runs are detached and supervised via
+  run-dir artifacts, so they deliberately outlive a daemon stop and are
+  adopted by the next one (see `[supervisor]` under Configuration).
 
 ```
 crates/bookshelf-core/   shared infra: domain + ports (EventSink, Triage),
@@ -95,8 +97,14 @@ docker compose logs -f librarian   # wait for "daemon ready"
 - Postgres state lives in the `bookshelf-pgdata` named volume; its port is
   published on **127.0.0.1 only** — that is the host CLI's door into the
   queue. Change the credentials for anything beyond a localhost setup.
-- `docker compose stop librarian` sends SIGTERM → graceful shutdown
-  (running job requeued, rsync children group-killed), exit 0.
+- `docker compose stop librarian` sends SIGTERM → graceful shutdown, exit
+  0. The supervised transfer detaches (`on_daemon_stop = "detach"`), so
+  the daemon never kills it, and attached listing calls stop
+  cooperatively. With the default in-container launcher the detached
+  transfer still dies with the container's PID namespace (no exit file);
+  the next boot's adopt recognizes that dead-unreaped signature and
+  requeues the job — or keeps the transfer truly alive across daemon
+  container restarts with `launcher = "docker"`.
 - rsync source: the container config pins `rsync_host = "rsync.ibiblio.org"`
   (A/B winner, ~114× faster listing); the daemon automatically alternates
   with `gutenberg.pglaf.org` on retries, so the ladder never repeats a host.
@@ -117,6 +125,62 @@ rsync nor the library dir on the host. For a standalone host binary:
 `cargo install --path crates/librarian`. `status` reports DB state via the
 same URL; its mirror-file walk is local — point `--config` at a config with
 `library_dir = "~/.bookshelf"` to see the container's library.
+
+## Deployment
+
+A deploy ships a new `librarian` binary; Postgres and the bind-mounted
+library (mirror, meta/, events.jsonl) are never touched by one.
+
+**Compose deployment (default).** Rebuild the daemon image from the
+working tree and replace the container:
+
+```sh
+docker compose up -d --build librarian   # daemon only
+docker compose up -d --build             # whole stack, no service name
+```
+
+The old container is stopped with SIGTERM (graceful stop); the Postgres
+and web containers and all bind-mounted state are untouched.
+
+**Native deployment.** Build, install, restart the service manager:
+
+```sh
+cargo build --release --locked -p librarian
+cargo install --path crates/librarian   # or copy target/release/librarian
+systemctl restart librarian             # or however the daemon is supervised
+```
+
+**What the first boot of a new binary does**, in order:
+
+1. Acquires the per-source executor advisory lock — fail-fast with
+   `another daemon owns execution` when a second daemon for the source is
+   still alive.
+2. Arms the signal handlers.
+3. Runs boot adoption over the run-dir artifacts (`Provider::adopt`): a
+   surviving detached transfer is resumed or finalized, dead ones are
+   requeued (see "Detached transfers and adoption").
+4. The stale-run sweep closes `sync_runs` rows still open from daemons
+   that died without artifacts (`aborted_reason = 'abandoned'`), logging
+   `closed abandoned sync_runs left open by dead daemons closed=N`.
+5. The scheduler starts.
+
+Step 4 is skipped entirely when adoption left a transfer alive
+mid-shutdown (`LeftDetached`) — that run is alive and its row must stay
+open.
+
+Whether a transfer survives a daemon/container stop at all depends on
+the launcher — the in-container process launcher dies with the container
+and is requeued, `launcher = "docker"` keeps it alive across container
+restarts; see `[supervisor]` and "Detached transfers and adoption".
+
+**Post-deploy verification:** `daemon ready` in the logs; the sweep line
+above when ghosts existed; `cargo run -p librarian -- watch` (or
+`librarian runs`) showing no `· running` rows that aren't genuinely
+running; the queue then idles until the scheduled `next full sync`.
+
+**Provenance.** Deploys build from the working tree — commit before
+deploying so the running binary maps to history
+(`<binary>: <imperative lowercase summary>`).
 
 ## Configuration
 
@@ -213,8 +277,10 @@ KillSignal=SIGTERM
 TimeoutStopSec=30
 ```
 
-SIGTERM/SIGINT stop job pickup, group-kill the active rsync, requeue the
-interrupted job (≥3 interruptions → failed) and exit 0.
+SIGTERM/SIGINT stop job pickup and exit 0. The supervised transfer detaches
+(default `on_daemon_stop = "detach"`) or is killed per config, and the next
+daemon adopts or requeues it; interrupted jobs requeue (≥3 interruptions →
+failed).
 
 ## Monitoring
 
@@ -318,6 +384,57 @@ Prometheus scrapes `:8889` every 5 s, and Grafana renders the provisioned
 progress + rate, the 120 s rsync-silence stall detector, the 90 s heartbeat
 threshold, queue/books/files by status, and cycle rate/duration.
 
+### `[supervisor]` — detached transfers
+
+Transfer runs are detached (`spawn_detached`: setsid, no PDEATHSIG) and
+supervised through durable run-dir artifacts (`<library_dir>/run/<source>-r<run_id>`:
+`intent.json`, `pid`, `stderr.log`, `exit`, `itemize.log`), so nothing
+transfer-related lives in daemon memory.
+
+```toml
+[supervisor]
+on_daemon_stop      = "detach"    # "detach" | "kill"
+launcher            = "process"   # "process" | "docker"
+poll_secs           = 10
+progress_stall_secs = 1800
+max_attempts        = 4
+docker_image        = ""          # required iff launcher = "docker"
+```
+
+| key | default | meaning |
+| --- | --- | --- |
+| `on_daemon_stop` | `"detach"` | On daemon stop, leave the running transfer alive (deploy-friendly); `"kill"` terminates it instead. |
+| `launcher` | `"process"` | Spawn path for supervised transfers; `"docker"` runs each transfer as one container. |
+| `poll_secs` | `10` | Supervisor poll cadence (run dir / container state). |
+| `progress_stall_secs` | `1800` | No itemize growth this long ⇒ the attempt is terminated and the retry ladder consumes it. Deliberately far above rsync's own `--timeout=600`, so a wedged connection dies by rsync's hand first. |
+| `max_attempts` | `4` | Transfer attempts per run, with the transport ladder delay between them (300 s → 600 s → 3600 s). |
+| `docker_image` | — | Image that contains rsync; **required iff `launcher = "docker"`**. |
+
+### Detached transfers and adoption
+
+- Transfers survive daemon restarts — deploys use the default `detach`:
+  SIGTERM never touches the running transfer, and the next daemon's boot
+  adopt resumes it or finalizes it from the exit file. A job caught
+  mid-transfer keeps its state; nothing is redownloaded. For a host
+  (systemd) daemon the transfer process outlives the restart; under
+  compose the default in-container launcher dies with the daemon
+  container and is requeued via the dead-unreaped path — `launcher =
+  "docker"` is the way to keep transfers running across container
+  restarts.
+- Hard-killed runs (OOM, SIGKILL, host reboot) are requeued with
+  `attempts++` on the next boot; at ≥3 attempts the job is failed.
+- **Upgrade note:** the first boot after upgrading may consume one
+  interruption credit for a job that was mid-transfer under the old
+  daemon — expect a possible requeue/attempt bump on that one job.
+- `launcher = "docker"` requirements: the `docker` CLI on the daemon's
+  PATH, `docker_image` containing rsync, access to the docker socket
+  (root-equivalent — run the daemon trusted), and the library
+  bind-mounted at the same absolute path inside the container, so run-dir
+  and mirror paths resolve identically on both sides. Containers are
+  created with `--restart=no` — the supervisor owns retries. The
+  docker-compose wiring for socket passthrough is deliberately left to
+  the operator.
+
 ## Web UI
 
 `librarian-web` is a read-only shell: JSON API under `/api`, the Leptos
@@ -405,7 +522,8 @@ KillSignal=SIGTERM
   `sync_runs`, `meta`, `jobs` — every row carries its `source`.
 - **`{library_dir}/events.jsonl`**: append-only audit trail, one JSON object
   per line (`book.discovered`, `file.transferred`, `file.repaired`,
-  `feed.checked`, …), tagged with `source`. Never rewritten or truncated.
+  `feed.checked`, `cycle.adopted`, …), tagged with `source`. Never
+  rewritten or truncated.
 - **`{library_dir}/meta/{id}.json`**: per-book sidecar (full record +
   categories + file paths), written on the transition to `synced`.
 

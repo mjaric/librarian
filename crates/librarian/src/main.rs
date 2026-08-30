@@ -6,7 +6,7 @@
 //! those reads); `retry-failed` is a direct DB repair.
 
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -15,10 +15,12 @@ use clap::{Parser, Subcommand};
 use bookshelf_core::{EventLog, InterruptFlag, StorePostgres};
 
 use librarian::config::Config;
-use librarian::gutenberg_org::GutenbergOrg;
+use librarian::gutenberg_org::{GutenbergOrg, SOURCE_KEY};
 use librarian::monitor;
-use librarian::provider::{CycleOpts, Provider, ensure_known_key, resolve};
+use librarian::provider::{AdoptAction, CycleOpts, Provider, ensure_known_key, resolve};
 use librarian::queue::JobQueue;
+use librarian::supervisor::{LauncherKind, ProcessLauncher, SyncLauncher};
+use librarian::supervisor_docker::DockerLauncher;
 use librarian::trigger::Trigger;
 
 #[derive(Parser)]
@@ -169,8 +171,23 @@ fn build_providers(
     events: Arc<EventLog>,
     interrupt: InterruptFlag,
 ) -> anyhow::Result<Vec<Arc<dyn Provider>>> {
+    let launcher: Arc<dyn SyncLauncher> = match cfg.supervisor_launcher {
+        LauncherKind::Process => Arc::new(ProcessLauncher),
+        LauncherKind::Docker => {
+            let Some(image) = cfg.docker_image.as_deref() else {
+                anyhow::bail!("launcher = \"docker\" requires [supervisor] docker_image");
+            };
+            DockerLauncher::probe(Path::new("docker"))?;
+            let docker = DockerLauncher::new(image);
+            let swept = docker.reap_orphans(SOURCE_KEY, &cfg.run_root())?;
+            if swept > 0 {
+                tracing::info!(swept, "boot sweep: removed orphaned docker transfers");
+            }
+            Arc::new(docker)
+        }
+    };
     Ok(vec![
-        Arc::new(GutenbergOrg::new(cfg, store, events, interrupt)?) as Arc<dyn Provider>,
+        Arc::new(GutenbergOrg::new(cfg, store, events, interrupt, launcher)?) as Arc<dyn Provider>,
     ])
 }
 
@@ -434,34 +451,7 @@ async fn run_daemon(cfg: Arc<Config>, provider_key: &str) -> anyhow::Result<()> 
     let obs = librarian::observability::Observability::new(source, cfg.otlp_endpoint.as_deref());
     provider.set_observability(obs.clone());
 
-    // -- startup reclaim + meta anchors
-    let reclaimed = store.reclaim_running_jobs().await?;
-    if reclaimed > 0 {
-        tracing::warn!(reclaimed, "requeued jobs stuck in running");
-    }
-    let now = time::OffsetDateTime::now_utc();
-    let rfc3339 = |t: time::OffsetDateTime| {
-        t.format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_default()
-    };
-    store
-        .set_meta(source, "daemon_anchor", &rfc3339(now))
-        .await?;
-    // A hard kill (SIGKILL/crash) bypasses the cycle guard's Drop — clear
-    // any stale active_run so the CLI never sees a ghost run.
-    store.clear_meta(source, "active_run").await?;
-    if store.get_meta(source, "next_full_sync").await?.is_none() {
-        let first = if cfg.backfill_on_start {
-            now
-        } else {
-            now + time::Duration::days(cfg.full_sync_interval_days as i64)
-        };
-        store
-            .set_meta(source, "next_full_sync", &rfc3339(first))
-            .await?;
-    }
-
-    // -- signals
+    // -- signals (before adoption: SIGTERM mid-adopt must detach cleanly)
     let sig_flag = interrupt.clone();
     tokio::spawn(async move {
         let term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
@@ -474,6 +464,128 @@ async fn run_daemon(cfg: Arc<Config>, provider_key: &str) -> anyhow::Result<()> 
             _ = term.recv() => sig_flag.set(),
         }
     });
+
+    // -- executor fence
+    // The session-scoped advisory lock fail-fasts a second daemon for this
+    // source. The ping task below exists because the lock lives on ONE
+    // pooled session: if that session dies (PG restart, network drop),
+    // Postgres RELEASES the lock and a successor could start while this
+    // daemon keeps running. On ping failure the flag stops this daemon
+    // rather than run unsupervised beside another executor.
+    let executor_guard = store
+        .executor_lock(&format!("librarian-executor:{source}"))
+        .await?;
+    {
+        let flag = interrupt.clone();
+        tokio::spawn(async move {
+            let guard = executor_guard;
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                if let Err(e) = guard.ping().await {
+                    tracing::error!(error = %e, "executor fence ping failed — stopping daemon");
+                    flag.set();
+                    break;
+                }
+            }
+        });
+    }
+
+    // -- meta anchors (before adoption: it can run for the length of a
+    // resumed transfer, and the anchor should reflect daemon start)
+    let now = time::OffsetDateTime::now_utc();
+    let rfc3339 = |t: time::OffsetDateTime| {
+        t.format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default()
+    };
+    store
+        .set_meta(source, "daemon_anchor", &rfc3339(now))
+        .await?;
+    if store.get_meta(source, "next_full_sync").await?.is_none() {
+        let first = if cfg.backfill_on_start {
+            now
+        } else {
+            now + time::Duration::days(cfg.full_sync_interval_days as i64)
+        };
+        store
+            .set_meta(source, "next_full_sync", &rfc3339(first))
+            .await?;
+    }
+
+    // -- boot-time adoption of detached runs (replaces the boot reclaim)
+    let report = provider.adopt().await?;
+    // Captured before the match: the Failed arm moves the error string out
+    // of report.action, so the boot sweep below cannot re-inspect it.
+    let left_detached = matches!(report.action, AdoptAction::LeftDetached);
+    match report.action {
+        AdoptAction::AdoptedAndCompleted { run_id } => {
+            let job_id = report.job_id.context("adopted run without a bound job")?;
+            queue.complete(job_id, Some(run_id), None).await?;
+            tracing::info!(job = job_id, run_id, "adopted detached run — completed");
+        }
+        AdoptAction::Requeued => {
+            if let Some(job_id) = report.job_id {
+                let requeued = queue.requeue_interrupted(job_id).await?;
+                tracing::warn!(
+                    job = job_id,
+                    requeued,
+                    "adopted run not resumable — job requeued"
+                );
+            }
+        }
+        AdoptAction::Failed(error) => {
+            if let Some(job_id) = report.job_id {
+                tracing::error!(job = job_id, error = %error, "adopted run failed");
+                queue.complete(job_id, None, Some(&error)).await?;
+            }
+        }
+        AdoptAction::LeftDetached => {
+            // Boot adoption was cut short by shutdown: the surviving
+            // transfer keeps running and the job deliberately stays
+            // 'running' (enqueue_coalesced fences new cycles; the next
+            // daemon binds job + artifacts and resumes). Touch NOTHING.
+            tracing::info!("adopt interrupted by shutdown — run left alive, next daemon re-adopts");
+        }
+        AdoptAction::Nothing => {
+            // Reclaim replacement for the artifact-less window: a job can
+            // be stuck 'running' when the previous daemon died outside any
+            // adoptable transfer (listing/ingest/repair phases, or a stop
+            // before the spawn). The old boot reclaim covered exactly this
+            // — keep it, scoped to the running job via the frozen queue API.
+            if let Some(job) = queue
+                .recent(source, 50)
+                .await?
+                .into_iter()
+                .find(|job| job.status == "running")
+            {
+                let requeued = queue.requeue_interrupted(job.id).await?;
+                tracing::warn!(
+                    job = job.id,
+                    requeued,
+                    "running job without run artifacts — requeued"
+                );
+            }
+        }
+    }
+    // Boot sweep: close sync_runs rows still open from daemons that died
+    // without artifacts (adoption closes the artifact-bearing ones). Skipped
+    // entirely on LeftDetached — that run is alive and its row must stay open.
+    // Safe without further guards: the executor fence was taken BEFORE adopt,
+    // so no other daemon for this source exists at this point.
+    if !left_detached {
+        let closed = store.abort_stale_runs(source).await?;
+        if closed > 0 {
+            tracing::warn!(
+                closed,
+                "closed abandoned sync_runs left open by dead daemons"
+            );
+        }
+    }
+    // A hard kill (SIGKILL/crash) bypasses the cycle guard's Drop — clear
+    // any stale active_run so the CLI never sees a ghost run. (Any adopt
+    // guard has dropped by the time we get here.)
+    store.clear_meta(source, "active_run").await?;
 
     // -- scheduler half
     {
@@ -581,9 +693,10 @@ async fn run_daemon(cfg: Arc<Config>, provider_key: &str) -> anyhow::Result<()> 
                 // onto it. Ended below on every path.
                 let root = obs.start_job_root(source, &job.kind, job.id);
                 let outcome = execute_job(provider.as_ref(), &job).await;
-                // Cycle accounting: ok | failed | interrupted, feeding the
-                // in-memory totals and the otel counter/histogram.
+                // Cycle accounting: ok | failed | interrupted | detached,
+                // feeding the in-memory totals and the otel counter.
                 let cycle_outcome = match &outcome {
+                    Ok(r) if r.aborted_reason.as_deref() == Some("detached") => "detached",
                     Ok(r) => {
                         if interrupt.is_set() || r.aborted_reason.as_deref() == Some("interrupted")
                         {
@@ -605,6 +718,19 @@ async fn run_daemon(cfg: Arc<Config>, provider_key: &str) -> anyhow::Result<()> 
                 );
                 match outcome {
                     Ok(report) => {
+                        // BEFORE the interrupt check: a detached transfer is
+                        // the whole point — the job stays 'running' so the
+                        // next daemon adopts it (enqueue_coalesced already
+                        // fences new cycles meanwhile), and we break WITHOUT
+                        // requeueing.
+                        if report.aborted_reason.as_deref() == Some("detached") {
+                            tracing::info!(
+                                job = job.id,
+                                run_id = report.run_id,
+                                "job left running (detached); next daemon adopts"
+                            );
+                            break;
+                        }
                         if interrupt.is_set()
                             || report
                                 .aborted_reason

@@ -17,9 +17,10 @@ pub use sqlx;
 pub use adapters::event_log::EventLog;
 pub use adapters::http::{FetchError, FetchErrorKind, PoliteClient};
 pub use adapters::rsync::{
-    ExitClass, InterruptFlag, ItemizeLine, RsyncOutcome, RsyncProgress, RsyncRunner, classify_exit,
-    parse_itemize,
+    DETACHED_WRAPPER, ExitClass, InterruptFlag, ItemizeLine, LiveState, RsyncOutcome,
+    RsyncProgress, RsyncRunner, RunIntent, classify_exit, clear_run, itemize_delta, parse_itemize,
+    read_exit, read_intent, read_pgid, run_is_live, spawn_detached, terminate_group, write_intent,
 };
-pub use adapters::store_postgres::StorePostgres;
+pub use adapters::store_postgres::{ExecutorGuard, StorePostgres};
 pub use adapters::triage_rules;
 pub use observability::ActiveRun;

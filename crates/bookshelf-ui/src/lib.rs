@@ -10,6 +10,7 @@ mod categories;
 mod cover;
 mod home;
 mod load;
+mod reader;
 mod search;
 mod search_widget;
 mod shell;
@@ -38,6 +39,8 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/search") view=search::Search />
                     <Route path=path!("/categories") view=categories::Categories />
                     <Route path=path!("/books/:id") view=book::BookView />
+                    <Route path=path!("/books/:id/read") view=reader::ReadPick />
+                    <Route path=path!("/books/:id/read/:format") view=reader::ReadView />
                 </Routes>
             </shell::Shell>
         </Router>

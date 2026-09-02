@@ -255,12 +255,12 @@ fn Fact(label: &'static str, value: Option<String>) -> impl IntoView {
 #[component]
 fn FileCard(id: i64, f: FileOffer) -> impl IntoView {
     let href = format!("/api/books/{id}/files/{}", f.format);
-    let open_href = format!("{href}?disposition=inline");
+    let read_href = format!("/books/{id}/read/{}", f.format);
+    let is_readable = matches!(f.format.as_str(), "txt" | "html.zip" | "epub.images");
     let stamp = f.extension.to_uppercase();
     let label = f.label.clone();
     let size = human_bytes(f.bytes);
     let download_name = format!("pg{id}.{}", f.extension);
-    let is_txt = f.format == "txt";
     let cloth = cloth_style(&f.format);
     view! {
         <div class="offer" style=cloth.clone()>
@@ -273,8 +273,8 @@ fn FileCard(id: i64, f: FileOffer) -> impl IntoView {
                 <a class="offer-btn" href=href.clone() download=download_name.clone()>
                     "Download"
                 </a>
-                <Show when=move || is_txt>
-                    <a class="offer-btn ghost" href=open_href.clone()>"Read"</a>
+                <Show when=move || is_readable>
+                    <a class="offer-btn ghost" href=read_href.clone()>"Read"</a>
                 </Show>
             </div>
         </div>

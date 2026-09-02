@@ -6,5 +6,6 @@ members = [
   "crates/bookshelf-ui",
   "crates/librarian-web",
   "crates/xtask",
+  "crates/bookshelf-reader",
 ]
 resolver = "3"

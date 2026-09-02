@@ -49,6 +49,10 @@ crates/bookshelf-api/    wire DTOs shared by every frontend shell and the
                           servers feeding them (serde only, wasm-safe)
 crates/bookshelf-ui/     the Leptos catalogue front end (CSR wasm bundle);
                           shell-agnostic by design — web today, desktop later
+crates/bookshelf-reader/ bytes in, books out: parses the mirrored txt /
+                          html.zip / epub files into sanitized sections
+                          with normalized text and text anchors — pure,
+                          wasm-safe, no IO; the UI embeds it directly
 crates/librarian-web/    the web shell binary: axum JSON API + static UI +
                           cover/file streaming from the local mirror
 crates/xtask/            cargo-native build orchestration (`dist`)
@@ -471,6 +475,70 @@ API surface: `/api/stats`, `/api/search?q&scope`, `/api/recent`,
 `/api/categories`, `/api/categories/{leaf}/books?q&limit`,
 `/api/books/{id}`, `/api/books/random`,
 `/api/books/{id}/files/{format}[?disposition=inline]`, `/api/covers/{id}`.
+
+### Reading a book
+
+Every book page offers its mirrored formats as take-out cards; **Read**
+opens the in-browser reader at `/books/{id}/read/{format}` (`txt`,
+`html.zip`, `epub.images` — the format-less `/books/{id}/read` redirects
+to the best mirrored one, in that order). The reader is a pure client:
+the wasm bundle downloads the file through the files API and parses it in
+the browser via `crates/bookshelf-reader`, so the server is untouched.
+
+Per format:
+
+- **txt** — one block per paragraph, Gutenberg's hard-wrapped lines
+  re-flowed. The boilerplate header/footer stays in verbatim; stripping
+  it is a deliberate future decision (indexing overlap), not an
+  oversight.
+- **html.zip** — the largest `.html` member is sanitized (ammonia;
+  scripts and handlers stripped) and rendered as-is otherwise, images
+  included: they are re-pointed at in-container blobs as you scroll — and
+  eagerly through a TOC-jump or restore target, so the layout settles
+  before the viewport moves.
+- **epub.images** — the OPF spine is the chapter order; the table of
+  contents comes from the EPUB 3 nav document (EPUB 2 NCX fallback) and
+  drives the drawer in the reader's top bar, which pins itself just below
+  the site topbar so it never scrolls away; a TOC click lands the chapter
+  heading directly beneath the two bars.
+
+**In-book links** work like a book, not like a browser bar: one click
+handler claims every anchor in the rendered content. External ones
+(`http(s)`, `mailto`, …) keep their default browser behavior; relative
+hrefs resolve against the linking chapter's container path
+(`Reader::section_index_for_path`) and scroll to the fragment's element
+or the target chapter's heading — always clearing the pinned bars, and
+never reaching the SPA router (an unknown target is reported to the
+console instead). Targets survive sanitization because the ammonia policy
+keeps `id` attributes (dropping the DOM-clobbering globals).
+
+**Position persistence** anchors your place in *text*, never pixels.
+~300 ms after you stop scrolling, the reader records which block sits at
+the viewport edge plus a fingerprint quote (~32 exact chars, ±16 of
+context) and stores it under the `reader:pos:project-gutenberg:{id}:{format}`
+key in `localStorage`. On reopen the quote is searched first — so
+re-layout and mild edits around the position don't lose it — the plain
+clamped offset is the second fallback, and if the recorded section no
+longer exists (say you switched formats) the offset maps proportionally
+onto the nearest section start.
+
+Verify by hand:
+
+```sh
+cargo run -p xtask -- dist                              # rebuild the bundle
+cargo run -p librarian-web -- --config librarian-smoke.toml
+# open a book page → Read; scroll; reload the reader page:
+#   it must reopen at (approximately) the same spot
+# the reader top bar stays pinned at any scroll depth, and TOC jumps
+#   land the chapter heading just below the bars (try an illustrated
+#   book's first chapters — late image loads must not push it off)
+# a book's own Contents section scrolls in-book: chapter links stay on
+#   the reader page and land their heading just below the bars
+```
+
+The reader is client-side only; a failing check is a UI problem, not DB
+state. Scroll position, TOC jumps and image rendering are the surfaces
+no automated test covers — eyeball them in a real browser.
 
 ### Deployment
 

@@ -1,0 +1,21 @@
+[package]
+name = "bookshelf-reader"
+version = "0.1.0"
+edition = "2024"
+
+# Bytes in, document model out: pure parsing/normalization, no tokio/sqlx/
+# reqwest/IO — compiles for both native and wasm32-unknown-unknown (same
+# discipline as bookshelf-api), so the UI crate can embed it directly.
+
+[dependencies]
+zip = { version = "=8.6.0", default-features = false, features = ["deflate", "deflate64"] }
+quick-xml = "=0.41.0"                    # matches the pin in bookshelf-core/librarian
+ego-tree = "=0.11.0"                     # scraper's tree type appears in our walker signatures
+scraper = "=0.27.0"
+ammonia = "=4.1.4"
+ropey = "=1.6.1"
+unicode-normalization = "=0.1.25"
+unicode-segmentation = "=1.13.3"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+anyhow = "=1.0.104"

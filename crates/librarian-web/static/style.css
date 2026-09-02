@@ -946,6 +946,106 @@ a.chip:hover { text-decoration: none; filter: brightness(1.12); }
 .searchpage { padding-top: 30px; }
 .searchpage .slip { margin-bottom: 4px; }
 
+/* ---- the reading room ------------------------------------------------------ */
+
+/* A single measured column, like a well-set octavo: enough measure for
+ * Garamond to breathe, never so much that the eye loses the line. */
+.reader { padding-top: 30px; }
+
+/* The reading toolbar pins itself just below the site topbar, so the way
+ * back to the shelf never scrolls away. Both bar heights are measured by
+ * the reader into --topbar-h / --reader-head-h on .reader (see
+ * sync_head_vars); the scroll targets below aim with those same numbers. */
+.reader-head {
+  position: sticky; top: var(--topbar-h, 0px);
+  z-index: 30;
+  background: var(--paper);
+  border-bottom: 1px solid var(--rule);
+  box-shadow: 0 3px 0 -2px var(--rule);
+}
+.reader-head-in {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 18px; max-width: 34rem; margin: 0 auto; padding: 10px 6px;
+}
+.reader-back {
+  color: var(--ink-faint); font-style: italic; font-size: 16px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.reader-back:hover { color: var(--oxblood); }
+
+.reader-toc { position: relative; flex-shrink: 0; }
+.reader-toc summary {
+  cursor: pointer; list-style: none; color: var(--verdigris);
+  font-family: var(--mono); font-size: 11.5px; letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.reader-toc summary::before { content: "☰ "; }
+.reader-toc[open] summary { color: var(--oxblood); }
+.reader-toc ul {
+  position: absolute; right: 0; z-index: 10; margin: 8px 0 0; padding: 8px 0;
+  min-width: 240px; max-height: 60vh; overflow: auto;
+  background: var(--paper-raised); border: 1px solid var(--rule-dark);
+  border-radius: 3px; box-shadow: 0 8px 24px rgba(38, 35, 28, 0.14);
+  list-style: none;
+}
+.reader-toc a {
+  display: block; padding: 5px 16px; color: var(--ink); font-size: 16px;
+}
+.reader-toc a:hover { background: var(--recess); text-decoration: none; }
+
+.reader-scroll { max-width: 34rem; margin: 0 auto; padding: 8px 6px 80px; }
+
+/* the strip the TOC jump and restore aim for: the section box and its
+ * first heading, kept clear of the pinned bars (heights published by the
+ * reader on .reader) */
+.reader-section,
+.reader-section-body :is(h1, h2, h3, h4, h5, h6) {
+  scroll-margin-top: calc(var(--topbar-h, 0px) + var(--reader-head-h, 0px));
+}
+
+.reader-section-body { line-height: 1.6; }
+
+/* in-book links read as body text, not chrome: ink color with a quiet
+ * underline, and the page's hover accent */
+.reader-section-body a {
+  color: inherit; text-decoration: underline; text-underline-offset: 3px;
+  text-decoration-color: var(--rule-dark);
+}
+.reader-section-body a:hover { color: var(--oxblood); }
+.reader-section-body > :first-child { margin-top: 0; }
+.reader-section-body p { margin: 0 0 1em; }
+.reader-section-body h1, .reader-section-body h2, .reader-section-body h3,
+.reader-section-body h4, .reader-section-body h5, .reader-section-body h6 {
+  margin: 1.6em 0 0.6em; line-height: 1.25;
+  font-variant: small-caps; letter-spacing: 0.02em;
+}
+.reader-section-body h1 { font-size: 30px; }
+.reader-section-body h2 { font-size: 25px; }
+.reader-section-body h3, .reader-section-body h4 { font-size: 21px; }
+.reader-section-body blockquote {
+  margin: 1.2em 0; padding: 2px 0 2px 18px;
+  border-left: 3px solid var(--rule-dark); color: var(--ink-faint);
+  font-style: italic;
+}
+.reader-section-body pre {
+  overflow-x: auto; margin: 1.2em 0; padding: 12px 14px;
+  background: var(--recess); border: 1px solid var(--rule); border-radius: 3px;
+  font-family: var(--mono); font-size: 13.5px; line-height: 1.45;
+}
+.reader-section-body img {
+  max-width: 100%; height: auto; display: block; margin: 1.4em auto;
+  border: 1px solid var(--rule); border-radius: 2px;
+}
+.reader-section-body table {
+  border-collapse: collapse; margin: 1.2em 0; font-size: 16px;
+}
+.reader-section-body td, .reader-section-body th {
+  border: 1px solid var(--rule); padding: 4px 10px; text-align: left;
+}
+.reader-p { text-indent: 1.4em; }
+.reader-p:first-child { text-indent: 0; }
+.reader-section-body > .reader-p:first-child { text-indent: 0; }
+
 /* ---- responsive -------------------------------------------------------------- */
 
 @media (max-width: 860px) {

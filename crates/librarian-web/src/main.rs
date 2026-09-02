@@ -9,6 +9,10 @@ mod api;
 mod config;
 
 use anyhow::Context;
+use axum::extract::Request;
+use axum::http::{HeaderValue, header::CACHE_CONTROL};
+use axum::middleware::Next;
+use axum::response::Response;
 use bookshelf_core::StorePostgres;
 use clap::Parser;
 use std::net::SocketAddr;
@@ -65,6 +69,17 @@ async fn shutdown_signal() {
     tracing::info!("shutting down");
 }
 
+/// Force revalidation of every static response. Bundle filenames are stable
+/// (no content hash), so `no-cache` is the only safe policy: the browser keeps
+/// its copy but must check ETag/Last-Modified each load — a miss is a cheap
+/// 304, a hit is fresh bytes, and a stale heuristic-fresh copy is impossible.
+async fn no_cache(req: Request, next: Next) -> Response {
+    let mut res = next.run(req).await;
+    res.headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    res
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
@@ -106,7 +121,6 @@ async fn main() -> anyhow::Result<()> {
         library_root,
     };
     let app = axum::Router::new()
-        .nest("/api", api::router())
         // Static assets first; anything else (SPA history routes like
         // /books/1342) falls back to index.html with a 200 — `fallback`,
         // not `not_found_service`, which would keep the 404 status.
@@ -115,6 +129,10 @@ async fn main() -> anyhow::Result<()> {
                 .append_index_html_on_directories(true)
                 .fallback(ServeFile::new(static_dir.join("index.html"))),
         )
+        // `layer` only wraps what was added before it, so `/api` (nested
+        // below) keeps its responses untouched.
+        .layer(axum::middleware::from_fn(no_cache))
+        .nest("/api", api::router())
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind)

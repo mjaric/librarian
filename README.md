@@ -76,7 +76,7 @@ Prerequisites: Rust (stable, edition 2024), `rsync` ≥ 3.x on PATH, Postgres
 # Postgres (skip if you already have one)
 docker run --name bookshelf-pg \
   -e POSTGRES_USER=bookshelf -e POSTGRES_PASSWORD=bookshelf \
-  -e POSTGRES_DB=bookshelf -p 5432:5432 -d postgres:16
+  -e POSTGRES_DB=bookshelf -p 5432:5432 -d pgvector/pgvector:pg18-trixie
 
 export BOOKSHELF_DATABASE_URL=postgres://bookshelf:bookshelf@localhost:5432/bookshelf
 
@@ -89,7 +89,7 @@ out of `librarian.toml`.
 ## Docker
 
 ```sh
-docker compose up -d --build       # postgres:16 + librarian daemon
+docker compose up -d --build       # postgres:18 + pgvector + librarian daemon
 docker compose logs -f librarian   # wait for "daemon ready"
 ```
 
